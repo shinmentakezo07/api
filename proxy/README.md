@@ -75,6 +75,8 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 | `clientKeys` | [] | required API keys for /v1/* (empty = open) |
 | `adminKey` | generated | admin UI key |
 | `retry` | 3 × 500ms | 429/5xx backoff retries |
+| `logRotate` | 10 MiB × 5 | size-based rotation of `gateway.log` (`gateway.log` → `gateway.1.log` …) |
+| `maxInFlightPerAccount` | 4 | free-pi session limit; logs `account at session limit` when reached |
 | `resetOnConcurrent` | 2 resets | auto session-reset on concurrent_session |
 
 ## Layout
@@ -93,4 +95,12 @@ src/server.js       router, failover, usage recording
 src/translate/      Anthropic <-> OpenAI translation (request/response/stream)
 ```
 
-Logs: `logs/gateway.log` (JSONL), usage: `logs/usage.json`.
+Logs: `logs/gateway.log` (JSONL, rotated in place), usage: `logs/usage.json`.
+
+Each `response` line carries `account`, `attempts` (upstream tries incl. retries),
+`failovers`, and `streamError` when a body copy broke mid-flight — in that case
+the same request is counted as `502` in `usage.json`, not `200`.
+
+Live concurrency is reported by `GET /health` (`inFlight` per account) and per
+account as `inFlight` in `/admin/api/overview`; `account at session limit` warns
+when an account reaches `maxInFlightPerAccount`.

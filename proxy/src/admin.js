@@ -3,7 +3,7 @@ import { config } from './config.js';
 import { log } from './logger.js';
 import { fingerprintHeaders } from './upstream.js';
 import {
-  listAccounts, addAccount, removeAccount, setEnabled, accountCount, mask,
+  listAccounts, addAccount, removeAccount, setEnabled, accountCount, mask, inFlightCount,
 } from './accounts.js';
 import { accountStats, totals, recentRequests } from './usage.js';
 
@@ -99,7 +99,10 @@ async function handleLoginPoll(req, res) {
 }
 
 // ---- router -------------------------------------------------------------------
-export async function handleAdmin(req, res, url) {
+export async function handleAdmin(req, res, urlOrCtx) {
+  // The router passes (req, res, rid, ctx) — tolerate any 4th arg and build the
+  // URL from the request itself.
+  const url = urlOrCtx instanceof URL ? urlOrCtx : new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
 
   if (path === '/admin' && req.method === 'GET') {
@@ -110,7 +113,7 @@ export async function handleAdmin(req, res, url) {
   if (!authorized(req, url)) return json(res, 401, { error: 'invalid admin key' });
 
   if (path === '/admin/api/overview' && req.method === 'GET') {
-    const accounts = listAccounts().map((a) => ({ ...a, usage: accountStats(a.id) }));
+    const accounts = listAccounts().map((a) => ({ ...a, usage: accountStats(a.id), inFlight: inFlightCount(a.id) }));
     return json(res, 200, {
       accounts,
       totals: totals(),

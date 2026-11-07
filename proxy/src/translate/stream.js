@@ -39,6 +39,7 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage) {
   let stop = 'end_turn';
   let inTokens = 0, outTokens = 0;
   let buffer = '';
+  let streamError = null;
 
   const ping = setInterval(() => send('ping', { type: 'ping' }), 15_000);
   const finish = () => { clearInterval(ping); try { res.end(); } catch {} };
@@ -75,6 +76,7 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage) {
       }
     }
   } catch (err) {
+    streamError = err;
     log.error('stream translation failed mid-flight', { error: err.message });
     send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${err.message}` } });
   } finally {
@@ -86,7 +88,7 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage) {
       usage: { output_tokens: outFinal, input_tokens: inTokens },
     });
     send('message_stop', { type: 'message_stop' });
-    onUsage?.({ inputTokens: inTokens, outputTokens: outFinal });
+    onUsage?.({ inputTokens: inTokens, outputTokens: outFinal }, streamError);
     finish();
   }
 }

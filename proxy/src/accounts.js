@@ -6,6 +6,28 @@ import { log } from './logger.js';
 
 let accounts = [];      // {id, label, token, source:'env'|'ui', enabled, addedAt, sessionId}
 let rrIndex = 0;        // round-robin cursor
+const inFlight = new Map();  // accountId -> count of concurrent upstream requests
+
+/** Mark a request as running against `account`; returns a release fn (idempotent). */
+export function beginRequest(account) {
+  const n = (inFlight.get(account.id) ?? 0) + 1;
+  inFlight.set(account.id, n);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (inFlight.get(account.id) ?? 1) - 1;
+    if (left <= 0) inFlight.delete(account.id); else inFlight.set(account.id, left);
+  };
+}
+
+export function inFlightCount(accountId) {
+  return inFlight.get(accountId) ?? 0;
+}
+
+export function inFlightAll() {
+  return Object.fromEntries(inFlight);
+}
 
 // --- stable per-account session id so restarts reuse backend session slots ---
 function sessionIdFor(token) {

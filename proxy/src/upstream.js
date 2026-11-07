@@ -6,10 +6,11 @@ import { log } from './logger.js';
 import { readFileSync } from 'node:fs';
 
 export class UpstreamError extends Error {
-  constructor(status, body, message) {
+  constructor(status, body, message, attempts) {
     super(message ?? `upstream ${status}`);
     this.status = status;
     this.body = body;
+    this.attempts = attempts ?? 1;
     this.code = body?.includes('concurrent_session') ? 'concurrent_session'
       : body?.includes('invalid_token') || status === 401 ? 'auth'
       : undefined;
@@ -122,7 +123,7 @@ export async function upstream(path, opts = {}) {
       throw err;
     }
 
-    if (res.ok) return res;
+    if (res.ok) { opts.onAttempt?.(attempt); return res; }
 
     const errText = await res.text().catch(() => '');
 
@@ -162,7 +163,7 @@ export async function upstream(path, opts = {}) {
       await new Promise((r) => setTimeout(r, wait));
       continue;
     }
-    throw new UpstreamError(res.status, errText);
+    throw new UpstreamError(res.status, errText, undefined, attempt);
   }
 }
 

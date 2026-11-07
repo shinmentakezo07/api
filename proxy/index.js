@@ -9,13 +9,16 @@ import { initAccounts, accountCount } from './src/accounts.js';
 import { initUsage, stopUsage } from './src/usage.js';
 import { createServer } from './src/server.js';
 
-// admin key: config override, else generate once and persist
+// admin key: .env/process env or shi.json override, else generated once and persisted
 let adminKey = config.adminKey;
 const keyFile = join(ROOT, '.admin-key');
+let keySource = config.adminKey ? '.env / config' : null;
 if (!adminKey) {
   if (existsSync(keyFile)) adminKey = readFileSync(keyFile, 'utf8').trim();
+  if (adminKey) keySource = '.admin-key';
   if (!adminKey) {
     adminKey = randomUUID().replace(/-/g, '');
+    keySource = 'generated (stored in .admin-key)';
     try { writeFileSync(keyFile, adminKey, { mode: 0o600 }); } catch {}
   }
 }
@@ -26,7 +29,7 @@ console.log(`  config   : ${configFileUsed}${hasConfigFile ? '' : ' (not found â
 console.log(`  upstream : ${config.base}`);
 console.log(`  model    : ${config.defaultModel}`);
 console.log(`  admin ui : http://${config.host}:${config.port}/admin`);
-console.log(`  admin key: ${adminKey}${config.adminKey ? ' (from config)' : ' (generated, stored in .admin-key)'}`);
+console.log(`  admin key: ${adminKey} (${keySource})`);
 console.log(`  log      : ${config.logFile} (${config.logLevel})`);
 
 initAccounts();

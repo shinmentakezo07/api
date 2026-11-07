@@ -17,6 +17,8 @@ const DEFAULTS = {
   credentialsFile: join(homedir(), '.free-pi', 'agent', 'credentials.json'),
   logFile: join(ROOT, 'logs', 'gateway.log'),
   logLevel: 'info',            // debug | info | warn | error
+  logRotate: { maxBytes: 10 * 1024 * 1024, maxFiles: 5 }, // gateway.log.N kept
+  maxInFlightPerAccount: 4,    // free-pi backend session limit, logged when approached
   envFile: join(ROOT, '.env'),
   accountsFile: join(ROOT, 'accounts.json'),
   usageFile: join(ROOT, 'logs', 'usage.json'),
@@ -47,10 +49,34 @@ if (existsSync(configFile)) {
 }
 
 // --- env layer -----------------------------------------------------------
+// parse .env (same format as accounts.js): KEY=VALUE lines, # comments, quotes stripped
+function parseEnvFile(path) {
+  try {
+    if (!existsSync(path)) return {};
+    const out = {};
+    for (const raw of readFileSync(path, 'utf8').split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq === -1) continue;
+      let val = line.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+      out[line.slice(0, eq).trim()] = val;
+    }
+    return out;
+  } catch { return {}; }
+}
+
+const envFile = parseEnvFile(join(ROOT, '.env'));
 const envCfg = {};
 if (process.env.PORT) envCfg.port = Number(process.env.PORT);
 if (process.env.FREEPI_BASE_URL) envCfg.base = process.env.FREEPI_BASE_URL;
 if (process.env.FREEPI_LOG_LEVEL) envCfg.logLevel = process.env.FREEPI_LOG_LEVEL;
+// admin key from .env or process env (ADMIN_KEY or FREEPI_ADMIN_KEY)
+if (process.env.ADMIN_KEY) envCfg.adminKey = process.env.ADMIN_KEY;
+if (process.env.FREEPI_ADMIN_KEY) envCfg.adminKey = process.env.FREEPI_ADMIN_KEY;
+if (envFile.ADMIN_KEY) envCfg.adminKey = envFile.ADMIN_KEY;
+if (envFile.FREEPI_ADMIN_KEY) envCfg.adminKey = envFile.FREEPI_ADMIN_KEY;
 
 // --- merge ---------------------------------------------------------------
 const merged = { ...DEFAULTS, ...fileCfg, ...envCfg };
