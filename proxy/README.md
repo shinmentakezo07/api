@@ -38,7 +38,12 @@ Each account is one free-pi JWT. Sources, in priority order:
 1. **`.env`** (read-only in the UI):
    - `FREEPI_ACCOUNTS=token1,token2` or `FREEPI_ACCOUNTS=["tok1","tok2"]`
    - or `FREEPI_TOKEN_1=...`, `FREEPI_TOKEN_2=...` (up to 20)
-2. **Admin UI** — added tokens are validated against `/me` and saved to `accounts.json` (mode 0600)
+2. **Admin UI** — two ways:
+   - **Sign in with GitHub** — runs the same device flow as free-pi-cli
+     (`/auth/github/device` → consent → poll `/auth/token`); open the link,
+     enter the code, and the new account's JWT is validated and saved to
+     `accounts.json` automatically
+   - **Paste a token** — validated against `/me` first; saved to `accounts.json` (mode 0600)
 3. **Fallback** — the free-pi CLI's own `~/.free-pi/agent/credentials.json`
 
 Requests are distributed **round-robin** across enabled accounts. If an account
