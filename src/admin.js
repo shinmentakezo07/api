@@ -257,6 +257,7 @@ const ADMIN_HTML = `<!doctype html>
       <input name="token" class="token" placeholder="account JWT token">
       <button data-action="addAccount">Add account</button>
     </div>
+    <p class="muted" id="adderr"></p>
     <div class="row">
       <button data-action="exportAccounts">Export accounts</button>
       <button data-action="importAccounts">Import accounts</button>
