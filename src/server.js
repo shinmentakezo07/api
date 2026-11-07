@@ -9,7 +9,7 @@ import { pickOrder, primaryAccount, beginRequest, inFlightCount, inFlightAll } f
 import { record } from './usage.js';
 import { getCatalog, resolveModel, defaultModel } from './catalog.js';
 import { anthropicToOpenAI } from './translate/request.js';
-import { openAIToAnthropic, errorBody } from './translate/response.js';
+import { openAIToAnthropic, errorBody, MalformedToolCallError } from './translate/response.js';
 import { streamTranslate } from './translate/stream.js';
 import { handleAdmin } from './admin.js';
 
@@ -30,10 +30,42 @@ function clientAuthorized(req) {
   return config.clientKeys.includes(key);
 }
 
-async function readBody(req) {
+async function readBody(req, limit = config.maxBodyBytes ?? 10 * 1024 * 1024) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size > limit) {
+      const err = new Error(`request body exceeds ${limit} bytes`);
+      err.status = 413;
+      throw err;
+    }
+    chunks.push(c);
+  }
   return Buffer.concat(chunks);
+}
+
+/** Light validation of an OpenAI chat body — returns an error string or null. */
+function validateChatBody(body) {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return 'messages must be a non-empty array';
+  for (const m of body.messages) {
+    if (!m || typeof m !== 'object' || !['system', 'user', 'assistant', 'tool', 'developer'].includes(m.role)) {
+      return `invalid message role: ${JSON.stringify(m?.role)}`;
+    }
+    if (m.content !== null && typeof m.content !== 'string' && !Array.isArray(m.content)) {
+      return `message content must be a string, array, or null (role ${m.role})`;
+    }
+  }
+  if (body.tools !== undefined) {
+    if (!Array.isArray(body.tools)) return 'tools must be an array';
+    for (const t of body.tools) {
+      if (t?.type !== 'function' || typeof t.function?.name !== 'string' || !t.function.name) {
+        return 'each tool must be {type:"function", function:{name, ...}}';
+      }
+    }
+  }
+  if (body.max_tokens !== undefined && !Number.isFinite(body.max_tokens)) return 'max_tokens must be a number';
+  return null;
 }
 
 /** Abort signal that fires when the client disconnects before the response ends. */
@@ -142,13 +174,27 @@ function recordOutcome(accountId, path, status, started, extra = {}) {
 // ---- route handlers ---------------------------------------------------------
 async function handleChatCompletions(req, res, rid, ctx) {
   const raw = await readBody(req);
+  let body;
+  try { body = JSON.parse(raw.toString('utf8') || '{}'); }
+  catch { return json(res, 400, errorBody(false, 400, 'request body is not valid JSON')); }
+  const verr = validateChatBody(body);
+  if (verr) return json(res, 400, errorBody(false, 400, verr));
+
+  const streaming = body.stream === true || body.stream === 'true';
+  if (body.stream === 'true') body.stream = true;           // coerce sloppy clients
+  else if (body.stream === 'false') body.stream = false;
+  // ask upstream for usage on streamed responses unless the caller already did
+  let bodyStr = raw;
+  if (streaming && !body.stream_options) {
+    body.stream_options = { include_usage: true };
+    bodyStr = JSON.stringify(body);
+  }
   const signal = clientAbort(res);
-  const streaming = (req.headers.accept ?? '').includes('text/event-stream') || raw.toString().includes('"stream":true');
 
   return withFailover(async (account) => {
     const started = Date.now();
     const up = await upstream('/v1/chat/completions', {
-      method: 'POST', body: raw, account, signal, onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
+      method: 'POST', body: bodyStr, account, signal, onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
     });
 
     if (!streaming) {
@@ -174,26 +220,55 @@ async function handleChatCompletions(req, res, rid, ctx) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...CORS });
     let inTok = 0, outTok = 0;
     let tail = '';
+    let lineBuf = '';
+    let sawUpstreamError = false;
     const pipe = await pipeBody(up, res, (buf) => {
       tail = (tail + buf.toString()).slice(-4000);
       const a = tail.match(/"prompt_tokens":\s*(\d+)/);
       const b = tail.match(/"completion_tokens":\s*(\d+)/);
       if (a) inTok = +a[1];
       if (b) outTok = +b[1];
+      // inspect complete SSE data lines: an upstream error mid-stream keeps a
+      // 200 status — surface it to the client as an OpenAI-style error chunk
+      lineBuf += buf.toString();
+      let nl;
+      while ((nl = lineBuf.indexOf('\n')) !== -1) {
+        const line = lineBuf.slice(0, nl).trim();
+        lineBuf = lineBuf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]' || !payload.startsWith('{')) continue;
+        try {
+          const obj = JSON.parse(payload);
+          if (obj.error && !obj.choices && !obj.id && !sawUpstreamError) {
+            sawUpstreamError = true;
+            const msgText = obj.error.message ?? 'upstream stream error';
+            if (ctx) ctx.streamError = msgText;
+            log.error('upstream error inside SSE stream', { rid, error: msgText });
+            res.write(`data: ${JSON.stringify({ error: { message: msgText, type: 'upstream_error', code: obj.error.code ?? obj.error.type ?? null } })}\n\n`);
+          }
+        } catch {}
+      }
     });
     if (!pipe.ok) {
       log.error('stream interrupted mid-flight', { rid, path: '/v1/chat/completions', account: account.id, bytes: pipe.bytes, error: pipe.error.message });
       if (ctx) ctx.streamError = pipe.error.message;
     }
-    recordOutcome(account.id, '/v1/chat/completions', pipe.ok ? 200 : 502, started, {
+    recordOutcome(account.id, '/v1/chat/completions', pipe.ok ? (sawUpstreamError ? 502 : 200) : 502, started, {
       inputTokens: inTok, outputTokens: outTok,
-      ...(pipe.ok ? {} : { error: `streaming interrupted after ${pipe.bytes}B: ${pipe.error.message}` }),
+      ...(pipe.ok ? (sawUpstreamError ? { error: 'upstream sent error mid-stream' } : {}) : { error: `streaming interrupted after ${pipe.bytes}B: ${pipe.error.message}` }),
     });
   }, { path: '/v1/chat/completions', rid, ctx });
 }
 
 async function handleMessages(req, res, rid, ctx) {
-  const body = JSON.parse((await readBody(req)).toString() || '{}');
+  const raw = await readBody(req);
+  let body;
+  try { body = JSON.parse(raw.toString('utf8') || '{}'); }
+  catch { return json(res, 400, errorBody(true, 400, 'request body is not valid JSON')); }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return json(res, 400, errorBody(true, 400, 'messages must be a non-empty array'));
+  }
   const signal = clientAbort(res);
   await getCatalog(primaryAccount());
   const oai = anthropicToOpenAI(body);
@@ -213,10 +288,18 @@ async function handleMessages(req, res, rid, ctx) {
           model: oai.model, ...usage,
           ...(streamError ? { error: `streaming interrupted: ${streamError.message}` } : {}),
         });
-      });
+      }, { stopSequences: body.stop_sequences });
     }
     const data = await up.json();
-    const msg = openAIToAnthropic(data, body.model);
+    let msg;
+    try { msg = openAIToAnthropic(data, body.model, { stopSequences: body.stop_sequences }); }
+    catch (err) {
+      if (err instanceof MalformedToolCallError) {
+        log.error('malformed tool arguments from upstream', { rid, error: err.message });
+        return json(res, 502, errorBody(true, 502, err.message));
+      }
+      throw err;
+    }
     recordOutcome(account.id, '/v1/messages', 200, started, {
       model: oai.model, inputTokens: msg.usage.input_tokens, outputTokens: msg.usage.output_tokens,
     });
@@ -302,7 +385,9 @@ export function createServer() {
     try {
       await route.handler(req, res, rid, ctx);
     } catch (err) {
-      const status = err instanceof UpstreamError ? err.status : err.message?.includes('no enabled accounts') ? 503 : 502;
+      const status = err instanceof UpstreamError ? err.status
+        : Number.isInteger(err.status) ? err.status
+        : err.message?.includes('no enabled accounts') ? 503 : 502;
       const detail = err instanceof UpstreamError ? err.body || err.message : err.message;
       record(ctx.account ?? 'gateway', { path: url.pathname, status, ms: Date.now() - started, error: detail });
       log.error('route failed', { rid, path: url.pathname, status, error: err.message, account: ctx.account, attempts: ctx.attempts, upstreamBody: String(detail).slice(0, 800) });
