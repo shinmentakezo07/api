@@ -160,6 +160,40 @@ export function removeAccount(id) {
   return true;
 }
 
+/** All accounts with full tokens — for the admin UI export (admin-key gated). */
+export function exportAccounts() {
+  return accounts.map(({ id, label, token, enabled, addedAt, source }) => ({
+    id, label, token, enabled, addedAt, source,
+  }));
+}
+
+/**
+ * Bulk-import accounts from a parsed payload. Accepts:
+ *   ["eyJ...", ...]                                  — bare tokens
+ *   [{ token, label?, enabled? }, ...]               — full objects
+ * Duplicates (by token) are skipped. Returns a per-item report.
+ */
+export function importAccounts(list) {
+  if (!Array.isArray(list)) return { error: 'payload must be an array of tokens or {token,label} objects' };
+  const results = [];
+  for (const item of list) {
+    const token = typeof item === 'string' ? item.trim() : String(item?.token ?? '').trim();
+    const label = typeof item === 'object' && item ? (item.label ?? undefined) : undefined;
+    const enabled = typeof item === 'object' && item ? item.enabled !== false : true;
+    if (!token || token.length < 20) { results.push({ token: token ? mask(token) : '(empty)', status: 'error', reason: 'token missing or too short' }); continue; }
+    if (accounts.some((a) => a.token === token)) { results.push({ token: mask(token), status: 'skipped', reason: 'already registered' }); continue; }
+    const acc = {
+      id: `ui-${randomUUID().slice(0, 8)}`,
+      label: label || `imported-${accounts.length + 1}`,
+      token, source: 'ui', enabled: !!enabled, addedAt: Date.now(), sessionId: sessionIdFor(token),
+    };
+    accounts.push(acc);
+    results.push({ token: mask(token), status: 'added', id: acc.id, label: acc.label });
+  }
+  persist();
+  return { results, added: results.filter(r => r.status === 'added').length, skipped: results.filter(r => r.status === 'skipped').length, errors: results.filter(r => r.status === 'error').length };
+}
+
 function persist() {
   const ui = accounts.filter((a) => a.source === 'ui').map(({ id, label, token, enabled, addedAt }) => ({ id, label, token, enabled, addedAt }));
   try {

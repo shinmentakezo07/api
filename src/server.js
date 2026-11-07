@@ -226,6 +226,8 @@ const ROUTES = [
   { method: 'POST', path: '/admin/api/accounts/login/poll', handler: (req, res, rid, url) => handleAdmin(req, res, url), anthropic: false },
   { method: 'POST', path: '/admin/api/accounts/:id/toggle', handler: (req, res, rid, url) => handleAdmin(req, res, url), anthropic: false },
   { method: 'DELETE', path: '/admin/api/accounts/:id', handler: (req, res, rid, url) => handleAdmin(req, res, url), anthropic: false },
+  { method: 'GET', path: '/admin/api/accounts/export', handler: (req, res, rid, url) => handleAdmin(req, res, url), anthropic: false },
+  { method: 'POST', path: '/admin/api/accounts/import', handler: (req, res, rid, url) => handleAdmin(req, res, url), anthropic: false },
   { method: 'GET', path: '/health', handler: handleHealth, anthropic: false },
 ];
 

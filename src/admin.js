@@ -4,6 +4,7 @@ import { log } from './logger.js';
 import { fingerprintHeaders } from './upstream.js';
 import {
   listAccounts, addAccount, removeAccount, setEnabled, accountCount, mask, inFlightCount,
+  exportAccounts, importAccounts,
 } from './accounts.js';
 import { accountStats, totals, recentRequests } from './usage.js';
 
@@ -166,6 +167,30 @@ export async function handleAdmin(req, res, urlOrCtx) {
     return ok ? json(res, 200, { ok: true }) : json(res, 404, { error: 'no such account (env/cli accounts cannot be removed here)' });
   }
 
+  // ---- export / import -------------------------------------------------------
+  if (path === '/admin/api/accounts/export' && req.method === 'GET') {
+    const payload = {
+      format: 'free-pi-gateway-accounts/v1',
+      exported_at: new Date().toISOString(),
+      accounts: exportAccounts(),
+    };
+    log.info('accounts exported via admin ui', { count: payload.accounts.length });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-disposition': `attachment; filename="freepi-accounts-${new Date().toISOString().slice(0, 10)}.json"`,
+    });
+    return res.end(JSON.stringify(payload, null, 2));
+  }
+
+  if (path === '/admin/api/accounts/import' && req.method === 'POST') {
+    const body = await readJson(req);
+    const list = Array.isArray(body) ? body : body.accounts;
+    const result = importAccounts(list);
+    if (result.error) return json(res, 400, { error: result.error });
+    log.info('accounts imported via admin ui', { added: result.added, skipped: result.skipped, errors: result.errors });
+    return json(res, 200, result);
+  }
+
   return json(res, 404, { error: `no admin route ${req.method} ${path}` });
 }
 
@@ -232,7 +257,13 @@ const ADMIN_HTML = `<!doctype html>
       <input name="token" class="token" placeholder="account JWT token">
       <button data-action="addAccount">Add account</button>
     </div>
-    <p class="muted">GitHub login runs the same device flow as free-pi-cli: sign in with the GitHub account you want to add. Env accounts (FREEPI_TOKEN_*) are read-only. UI accounts are stored in accounts.json.</p>
+    <div class="row">
+      <button data-action="exportAccounts">Export accounts</button>
+      <button data-action="importAccounts">Import accounts</button>
+      <input type="file" id="importFile" accept="application/json,.json" style="display:none">
+      <span class="muted" id="importResult"></span>
+    </div>
+    <p class="muted">GitHub login runs the same device flow as free-pi-cli: sign in with the GitHub account you want to add. Env accounts (FREEPI_TOKEN_*) are read-only. UI accounts are stored in accounts.json. Export/import uses a JSON file with full tokens — keep it secret.</p>
   </div>
 
   <div class="card"><h2>Accounts · round-robin</h2>
@@ -348,6 +379,37 @@ document.addEventListener('click', (e)=>{
   if(a==='del'){ if(confirm('remove account?')) api('/admin/api/accounts/'+b.dataset.id,{method:'DELETE'}).then(load); }
   if(a==='addAccount') addAccount();
   if(a==='startLogin') startLogin();
+  if(a==='exportAccounts') exportAccounts();
+  if(a==='importAccounts') document.getElementById('importFile').click();
+});
+document.getElementById('importFile').addEventListener('change', async (e)=>{
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if(!file) return;
+  const out = document.getElementById('importResult');
+  try {
+    const parsed = JSON.parse(await file.text());
+    const list = Array.isArray(parsed) ? parsed : parsed.accounts;
+    const r = await fetch('/admin/api/accounts/import', { method:'POST', headers:H(), body: JSON.stringify({ accounts: list }) });
+    const d = await r.json();
+    if(!r.ok){ out.textContent = d.error || ('HTTP '+r.status); out.className='err'; return; }
+    out.textContent = 'added '+d.added+', skipped '+d.skipped+', errors '+d.errors;
+    out.className='muted';
+    load();
+  } catch(err){ out.textContent = 'import failed: '+err.message; out.className='err'; }
+});
+async function exportAccounts(){
+  try {
+    const r = await fetch('/admin/api/accounts/export', { headers: H() });
+    if(!r.ok){ const d = await r.json().catch(()=>({})); document.getElementById('importResult').textContent = d.error || ('HTTP '+r.status); return; }
+    const blob = new Blob([await r.text()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (r.headers.get('content-disposition')||'').match(/filename="?([^"]+)"?/)?.[1] || 'freepi-accounts.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch(err){ document.getElementById('importResult').textContent = 'export failed: '+err.message; }
+}
   if(a==='cancelLogin') endLogin(null);
 });
 load(); setInterval(()=>{ if(!login) load(); }, 5000);
