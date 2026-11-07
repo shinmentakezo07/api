@@ -379,6 +379,7 @@ document.addEventListener('click', (e)=>{
   if(a==='del'){ if(confirm('remove account?')) api('/admin/api/accounts/'+b.dataset.id,{method:'DELETE'}).then(load); }
   if(a==='addAccount') addAccount();
   if(a==='startLogin') startLogin();
+  if(a==='cancelLogin') endLogin(null);
   if(a==='exportAccounts') exportAccounts();
   if(a==='importAccounts') document.getElementById('importFile').click();
 });
@@ -410,7 +411,5 @@ async function exportAccounts(){
     URL.revokeObjectURL(a.href);
   } catch(err){ document.getElementById('importResult').textContent = 'export failed: '+err.message; }
 }
-  if(a==='cancelLogin') endLogin(null);
-});
 load(); setInterval(()=>{ if(!login) load(); }, 5000);
 </script></body></html>`;
