@@ -5,20 +5,58 @@ import { config, CLIENT_VERSION } from './config.js';
 import { log } from './logger.js';
 import { readFileSync } from 'node:fs';
 
+/** Error codes free-pi raises (from the CLI's mapErrorCode); used for text fallback. */
+const KNOWN_CODES = [
+  'concurrent_session', 'concurrent', 'ads_required', 'context_too_long',
+  'context_ceiling', 'context_too_long_for_fallback', 'daily_cap', 'hourly_ceiling',
+  'rolling_cap', 'global_cap', 'queue_wait', 'upgrade_required', 'consent_required',
+  'guest_allowance', 'guest_unavailable', 'guest_login_required', 'region_unavailable',
+  'model_requires_credits', 'premium_allowance', 'model_at_capacity',
+  'reward_required', 'account_review', 'invalid_token',
+];
+
 export class UpstreamError extends Error {
-  constructor(status, body, message, attempts) {
-    super(message ?? `upstream ${status}`);
+  constructor(status, body, message, attempts, preParsed) {
+    // Parse the structured error envelope exactly once. free-pi reports limit
+    // metadata in the BODY (`limit`, `retry_after_seconds`, `clears_at`,
+    // `remaining_credits_today`, `lane`) — not in a Retry-After header.
+    const env = preParsed ?? parseEnvelope(body);
+    super(message ?? env?.message ?? `upstream ${status}`);
     this.status = status;
     this.body = body;
     this.attempts = attempts ?? 1;
-    // parse the structured error code ("concurrent", "concurrent_session",
-    // "ads_required", "context_too_long", ...) from the JSON body
-    let code;
-    try { code = JSON.parse(body)?.code; } catch {}
-    this.code = code
-      ?? (body?.includes('concurrent_session') ? 'concurrent_session' : undefined);
+    this.envelope = env;
+    // bodies that aren't clean JSON still carry the code as text — keep the
+    // fallback for every known code, not just concurrent_session
+    this.code = env?.code
+      ?? KNOWN_CODES.find((c) => body?.includes(c));
     if (status === 401 || body?.includes('invalid_token')) this.code = 'auth';
+    this.retryAfterMs = retryHint(env);
   }
+}
+
+/** Parse a free-pi error body into its envelope, or null when it isn't JSON. */
+export function parseEnvelope(body) {
+  let env;
+  try { env = JSON.parse(body); } catch { return null; }
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  return {
+    code: typeof (env.code ?? env.error?.code) === 'string' ? (env.code ?? env.error.code) : undefined,
+    message: typeof (env.message ?? env.error?.message) === 'string' ? (env.message ?? env.error.message) : undefined,
+    limit: typeof env.limit === 'string' ? env.limit : undefined,
+    retry_after_seconds: num(env.retry_after_seconds),
+    clears_at: typeof env.clears_at === 'string' ? env.clears_at : undefined,
+    remaining_credits_today: num(env.remaining_credits_today),
+    lane: env.lane === 'slow' ? 'slow' : undefined,
+    hourly_ceiling: num(env.hourly_ceiling),
+  };
+}
+
+/** Envelope `retry_after_seconds` in ms, or null. */
+function retryHint(env) {
+  const v = env?.retry_after_seconds;
+  return typeof v === 'number' && v > 0 ? v * 1000 : null;
 }
 
 export function fingerprintHeaders(account, extra = {}, path = '') {
@@ -158,6 +196,7 @@ export async function upstream(path, opts = {}) {
     if (res.ok) return res;
 
     const errText = await res.text().catch(() => '');
+    const envelope = parseEnvelope(errText);   // single parse, reused below
 
     if (errText.includes('concurrent_session') && resets < config.resetOnConcurrent.maxResets) {
       resets++;
@@ -203,11 +242,18 @@ export async function upstream(path, opts = {}) {
       }
     }
 
-    // honor Retry-After on 429 before the generic backoff path
+    // honor Retry-After header, else the body's retry_after_seconds (what the
+    // free-pi CLI itself uses), else exponential backoff
     if (res.status === 429 && attempt < retries) {
+      const hinted = retryHint(envelope);
       const ra = Number(res.headers.get('retry-after'));
-      const wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 30_000) : jitter(config.retry.backoffMs * 2 ** (attempt - 1));
-      log.warn('upstream 429, backing off', { path, account: account.id, attempt, wait, retryAfter: Number.isFinite(ra) ? ra : undefined });
+      const fromHeader = Number.isFinite(ra) && ra > 0 ? ra * 1000 : null;
+      const wait = Math.min(fromHeader ?? hinted ?? jitter(config.retry.backoffMs * 2 ** (attempt - 1)), 30_000);
+      log.warn('upstream 429, backing off', {
+        path, account: account.id, attempt, wait,
+        retryAfter: fromHeader != null ? fromHeader / 1000 : undefined,
+        bodyHint: hinted != null ? hinted / 1000 : undefined,
+      });
       await sleep(wait, opts.signal);
       continue;
     }
@@ -218,7 +264,7 @@ export async function upstream(path, opts = {}) {
       await sleep(wait, opts.signal);
       continue;
     }
-    throw new UpstreamError(res.status, errText, undefined, attempt);
+    throw new UpstreamError(res.status, errText, undefined, attempt, envelope);
   }
 }
 

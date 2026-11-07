@@ -288,7 +288,7 @@ async function handleMessages(req, res, rid, ctx) {
           model: oai.model, ...usage,
           ...(streamError ? { error: `streaming interrupted: ${streamError.message}` } : {}),
         });
-      }, { stopSequences: body.stop_sequences });
+      }, { stopSequences: body.stop_sequences, signal });
     }
     const data = await up.json();
     let msg;

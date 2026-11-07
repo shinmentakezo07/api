@@ -34,8 +34,15 @@ export function reasoningEffortFromAnthropic(thinking) {
 const REASONING_FIELDS = [
   'reasoning_effort', 'reasoning', 'thinking', 'thinking_budget',
   'enable_thinking', 'include_reasoning', 'reasoning_content',
-  'chat_template_kwargs',
+  'chat_template_kwargs', 'reasoning_summary', 'reasoning_token_budget',
 ];
+
+/** Case/whitespace-tolerant effort read: ' HIGH ' -> 'high'; anything else passes through. */
+function normalizeEffort(value) {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  return v || null;
+}
 
 /**
  * Normalize an OpenAI chat body (parsed object, mutated in place):
@@ -49,11 +56,19 @@ export function normalizeOpenAIReasoning(body) {
     if (k in body) { grabbed[k] = body[k]; dropped.push(k); delete body[k]; }
   }
 
-  let effort = typeof grabbed.reasoning_effort === 'string' && grabbed.reasoning_effort
-    ? grabbed.reasoning_effort : null;
+  let effort = normalizeEffort(grabbed.reasoning_effort);
 
-  if (!effort) {
-    const t = grabbed.thinking;
+  // explicit off signals beat any requested effort: a client that says "no
+  // thinking" must never be billed for reasoning tokens just because a default
+  // effort (or its own effort field) is also present.
+  const t = grabbed.thinking;
+  const explicitlyOff =
+    (t && typeof t === 'object' && t.type === 'disabled') ||
+    t === 'disabled' || t === false ||
+    grabbed.enable_thinking === false ||
+    grabbed.chat_template_kwargs?.enable_thinking === false;
+
+  if (!explicitlyOff && !effort) {
     if (t && typeof t === 'object' && t.type === 'enabled') {
       effort = budgetToEffort(t.budget_tokens) ?? 'medium';
     } else if (t === 'enabled' || t === true) {
@@ -61,13 +76,10 @@ export function normalizeOpenAIReasoning(body) {
     }
     if (grabbed.enable_thinking === true) effort = effort ?? 'medium';
     if (grabbed.chat_template_kwargs?.enable_thinking === true) effort = effort ?? 'medium';
-    if (typeof grabbed.reasoning === 'string') effort = effort ?? grabbed.reasoning;
-    else if (grabbed.reasoning?.effort) effort = effort ?? grabbed.reasoning.effort;
-    // explicit off signals win only when no explicit effort was requested
-    if ((t && typeof t === 'object' && t.type === 'disabled') || grabbed.enable_thinking === false) {
-      effort = null;
-    }
+    if (typeof grabbed.reasoning === 'string') effort = effort ?? normalizeEffort(grabbed.reasoning);
+    else if (grabbed.reasoning?.effort) effort = effort ?? normalizeEffort(grabbed.reasoning.effort);
   }
+  if (explicitlyOff) effort = null;
 
   if (effort) effort = EFFORT_CLAMP[effort] ?? effort;
   if (effort && VALID_EFFORTS.has(effort)) body.reasoning_effort = effort;
