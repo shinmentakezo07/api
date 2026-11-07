@@ -1,0 +1,24 @@
+{
+  "port": 8787,
+  "host": "127.0.0.1",
+  "base": "https://api.freepi.ai",
+  "cliVersion": "0.6.14",
+  "defaultModel": "deepseek/deepseek-v4-flash",
+  "credentialsFile": "/data/home/.free-pi/agent/credentials.json",
+  "sessionId": "fpgateway-8787-fixed-session-01",
+  "logFile": "/data/home/shinmne/proxy/logs/gateway.log",
+  "logLevel": "info",
+  "clientKeys": [],
+  "catalogTtlMs": 300000,
+  "retry": {
+    "maxAttempts": 3,
+    "backoffMs": 500
+  },
+  "resetOnConcurrent": {
+    "maxResets": 2,
+    "settleMs": 500
+  },
+  "credRefreshMs": 60000,
+  "requestTimeoutMs": 300000,
+  "piEngineVersion": "1.5.0"
+}

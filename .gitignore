@@ -1,0 +1,11 @@
+node_modules/
+dist/
+
+# secrets & runtime state
+proxy/.admin-key
+proxy/accounts.json
+proxy/.env
+proxy/logs/
+
+# os noise
+.DS_Store
