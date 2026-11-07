@@ -37,6 +37,11 @@ initUsage();
 const { total, enabled } = accountCount();
 console.log(`  accounts : ${enabled} enabled / ${total} total (round-robin)`);
 
+// keep accounts ad-compliant like the real CLI (banner cycle every 10 min)
+const { startAdHeartbeat } = await import('./src/ads.js');
+const { accountsForAds } = await import('./src/accounts.js');
+startAdHeartbeat(accountsForAds);
+
 try {
   // touch credentials early so a missing file fails fast
   const { initCredentials } = await import('./src/credentials.js');

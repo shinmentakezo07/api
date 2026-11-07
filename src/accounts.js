@@ -128,6 +128,11 @@ export function listAccounts() {
   return accounts.map(({ token, ...rest }) => ({ ...rest, tokenMask: mask(token) }));
 }
 
+/** Enabled accounts with tokens — for the ads heartbeat only (not for the UI). */
+export function accountsForAds() {
+  return accounts.filter((a) => a.enabled && a.token).map(({ id, token, sessionId, enabled }) => ({ id, token, sessionId, enabled }));
+}
+
 export function findAccount(id) {
   return accounts.find((a) => a.id === id) ?? null;
 }

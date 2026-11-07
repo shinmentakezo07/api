@@ -102,6 +102,7 @@ export async function upstream(path, opts = {}) {
   let reloadedCreds = false;
   let resets = 0;
   let reasoningStripped = false;
+  let adCycles = 0;
 
   // Proactively drop reasoning controls on chat bodies (some upstream models reject them).
   if (opts.body && path.includes('/chat/completions')) {
@@ -135,6 +136,17 @@ export async function upstream(path, opts = {}) {
       if (config.resetOnConcurrent.settleMs > 0) {
         await new Promise((r) => setTimeout(r, config.resetOnConcurrent.settleMs));
       }
+      attempt--;
+      continue;
+    }
+
+    // Backend pauses accounts that aren't consuming ads -> run the CLI's ad
+    // cycle (fetch ad, fire impression) and retry, same spirit as session reset.
+    if (errText.includes('ads_required') && adCycles < 2) {
+      adCycles++;
+      const { recoverFromAdsRequired } = await import('./ads.js');
+      const posted = await recoverFromAdsRequired(account);
+      log.info('ads_required recovery', { path, account: account.id, posted });
       attempt--;
       continue;
     }
