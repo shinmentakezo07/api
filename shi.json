@@ -6,7 +6,7 @@
   "defaultModel": "deepseek/deepseek-v4-flash",
   "credentialsFile": "/data/home/.free-pi/agent/credentials.json",
   "sessionId": "fpgateway-8787-fixed-session-01",
-  "logFile": "/data/home/shinmne/proxy/logs/gateway.log",
+  "logFile": "/data/home/shinmne/logs/gateway.log",
   "logLevel": "info",
   "clientKeys": [],
   "catalogTtlMs": 300000,

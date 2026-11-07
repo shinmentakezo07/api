@@ -2,10 +2,10 @@ node_modules/
 dist/
 
 # secrets & runtime state
-proxy/.admin-key
-proxy/accounts.json
-proxy/.env
-proxy/logs/
+.admin-key
+accounts.json
+.env
+logs/
 
 # os noise
 .DS_Store

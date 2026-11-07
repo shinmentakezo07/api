@@ -82,7 +82,7 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 ## Run with Docker
 
 ```bash
-cd proxy
+cd repo-root
 docker compose up -d --build        # gateway on http://localhost:8787
 ```
 
