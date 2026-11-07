@@ -1,0 +1,8 @@
+# keep host-specific state and secrets out of the image
+shi.json
+.env
+accounts.json
+.admin-key
+logs/
+node_modules/
+*.png

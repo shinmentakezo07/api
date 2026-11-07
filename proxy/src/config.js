@@ -70,8 +70,11 @@ function parseEnvFile(path) {
 const envFile = parseEnvFile(join(ROOT, '.env'));
 const envCfg = {};
 if (process.env.PORT) envCfg.port = Number(process.env.PORT);
+if (process.env.HOST) envCfg.host = process.env.HOST;          // 0.0.0.0 in containers
 if (process.env.FREEPI_BASE_URL) envCfg.base = process.env.FREEPI_BASE_URL;
 if (process.env.FREEPI_LOG_LEVEL) envCfg.logLevel = process.env.FREEPI_LOG_LEVEL;
+if (process.env.DATA_DIR) envCfg.dataDir = process.env.DATA_DIR; // writable state dir (docker)
+if (process.env.FREEPI_CREDENTIALS_FILE) envCfg.credentialsFile = process.env.FREEPI_CREDENTIALS_FILE;
 // admin key from .env or process env (ADMIN_KEY or FREEPI_ADMIN_KEY)
 if (process.env.ADMIN_KEY) envCfg.adminKey = process.env.ADMIN_KEY;
 if (process.env.FREEPI_ADMIN_KEY) envCfg.adminKey = process.env.FREEPI_ADMIN_KEY;
@@ -86,6 +89,14 @@ if (argOf('--log-level')) merged.logLevel = argOf('--log-level');
 if (argOf('--default-model')) merged.defaultModel = argOf('--default-model');
 merged.base = String(merged.base).replace(/\/+$/, '');
 merged.port = Number(merged.port);
+
+// dataDir: where writable state lives (logs, accounts.json, .admin-key).
+// Defaults to the install dir; containers set DATA_DIR=/app/data.
+const dataDir = merged.dataDir ?? ROOT;
+merged.dataDir = dataDir;
+merged.logFile = fileCfg.logFile ?? join(dataDir, 'logs', 'gateway.log');
+merged.accountsFile = fileCfg.accountsFile ?? join(dataDir, 'accounts.json');
+merged.usageFile = fileCfg.usageFile ?? join(dataDir, 'logs', 'usage.json');
 
 export const config = merged;
 export const configFileUsed = configFile;

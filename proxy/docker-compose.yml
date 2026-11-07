@@ -1,0 +1,25 @@
+services:
+  gateway:
+    build: .
+    image: freepi-gateway:latest
+    container_name: freepi-gateway
+    ports:
+      - "8787:8787"
+    environment:
+      # container-specific settings (shi.json is intentionally not baked in)
+      - HOST=0.0.0.0
+      - DATA_DIR=/app/data
+      # Optional: reuse the host CLI's signed-in account as the fallback account.
+      # If enabled, also uncomment the matching volume mount below.
+      # - FREEPI_CREDENTIALS_FILE=/app/data/credentials.json
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - freepi-data:/app/data
+      # Optional: host CLI credentials as fallback account
+      # - ${HOME}/.free-pi/agent/credentials.json:/app/data/credentials.json:ro
+    restart: unless-stopped
+
+volumes:
+  freepi-data:

@@ -11,7 +11,7 @@ import { createServer } from './src/server.js';
 
 // admin key: .env/process env or shi.json override, else generated once and persisted
 let adminKey = config.adminKey;
-const keyFile = join(ROOT, '.admin-key');
+const keyFile = join(config.dataDir ?? ROOT, '.admin-key');
 let keySource = config.adminKey ? '.env / config' : null;
 if (!adminKey) {
   if (existsSync(keyFile)) adminKey = readFileSync(keyFile, 'utf8').trim();

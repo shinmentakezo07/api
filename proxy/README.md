@@ -79,6 +79,31 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 | `maxInFlightPerAccount` | 4 | free-pi session limit; logs `account at session limit` when reached |
 | `resetOnConcurrent` | 2 resets | auto session-reset on concurrent_session |
 
+## Run with Docker
+
+```bash
+cd proxy
+docker compose up -d --build        # gateway on http://localhost:8787
+```
+
+- State (accounts.json, logs, .admin-key) persists in the `freepi-data` volume
+- Host `shi.json` is intentionally **not** baked into the image — configure via
+  env vars instead: `ADMIN_KEY`, `PORT`, `HOST`, `DATA_DIR`,
+  `FREEPI_CREDENTIALS_FILE`, `FREEPI_TOKEN_1..20` (in `.env`, picked up by
+  `env_file`)
+- Add your first account from the admin UI (`http://localhost:8787/admin`) via
+  the GitHub login flow — it survives restarts in the volume
+- Optional: reuse the host CLI's signed-in account — uncomment the
+  `FREEPI_CREDENTIALS_FILE` env and the credentials volume mount in
+  `docker-compose.yml`
+
+Manual run without compose:
+
+```bash
+docker build -t freepi-gateway .
+docker run -d -p 8787:8787 -e ADMIN_KEY=change-me -v freepi-data:/app/data freepi-gateway
+```
+
 ## Layout
 
 ```
