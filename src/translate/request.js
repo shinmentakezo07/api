@@ -1,5 +1,6 @@
 // translate/request.js — Anthropic Messages -> OpenAI Chat Completions
 import { resolveModel } from '../catalog.js';
+import { reasoningEffortFromAnthropic } from '../reasoning.js';
 
 export function textOf(content) {
   if (typeof content === 'string') return content;
@@ -65,6 +66,10 @@ export function anthropicToOpenAI(body) {
   if (body.temperature !== undefined) out.temperature = body.temperature;
   if (body.top_p !== undefined) out.top_p = body.top_p;
   if (body.stop_sequences?.length) out.stop = body.stop_sequences;
+
+  // client reasoning intent (Anthropic thinking) -> upstream reasoning_effort
+  const effort = reasoningEffortFromAnthropic(body.thinking);
+  if (effort) out.reasoning_effort = effort;
 
   if (body.tools?.length) {
     out.tools = body.tools.map((t) => ({

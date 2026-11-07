@@ -12,6 +12,9 @@ export function openAIToAnthropic(oai, requestModel) {
   const msg = choice.message ?? {};
   const content = [];
 
+  // upstream reasoning (when the client asked for it) -> Anthropic thinking block
+  if (msg.reasoning_content) content.push({ type: 'thinking', thinking: msg.reasoning_content });
+
   if (msg.content) content.push({ type: 'text', text: msg.content });
 
   for (const tc of msg.tool_calls ?? []) {

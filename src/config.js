@@ -25,7 +25,9 @@ const DEFAULTS = {
   adminKey: '',                // empty = generate one at startup (persisted to .admin-key)
   clientKeys: [],              // empty = accept any key; else list of allowed keys
   catalogTtlMs: 300_000,
-  retry: { maxAttempts: 3, backoffMs: 500 },   // on 429/5xx, before first byte sent
+  retry: { maxAttempts: 3, backoffMs: 500, timeoutRetries: 1 },   // on 429/5xx, before first byte sent; timeouts get their own small budget
+  maxTotalAttempts: 10,        // global cap on upstream attempts per client request (across accounts)
+  busyWaitMs: 15_000,          // when every account is at its in-flight cap, wait up to this for a free slot
   resetOnConcurrent: { maxResets: 2, settleMs: 500 }, // auto /close-other-session on concurrent_session
   credRefreshMs: 60_000,       // re-read credentials.json at most this often
   requestTimeoutMs: 300_000,   // hard cap per upstream call

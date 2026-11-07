@@ -36,6 +36,13 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+/** Abort signal that fires when the client disconnects before the response ends. */
+function clientAbort(res) {
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) ac.abort(new Error('client disconnected')); });
+  return ac.signal;
+}
+
 /**
  * Copy an upstream body to the client. Returns { ok, bytes, error }.
  * A failure here means the client sees a truncated response, so callers must
@@ -50,7 +57,15 @@ async function pipeBody(up, res, tap) {
       if (done) break;
       bytes += value.byteLength;
       if (tap) tap(value);
-      if (!res.write(value)) await new Promise((r) => res.once('drain', r));
+      if (!res.write(value)) {
+        // wait for drain, but bail out if the client goes away instead
+        await new Promise((resolve) => {
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+          res.once('drain', done);
+          res.once('close', done);
+        });
+        if (res.destroyed || res.writableEnded) throw new Error('client disconnected');
+      }
     }
     res.end();
     return { ok: true, bytes, error: null };
@@ -63,41 +78,57 @@ async function pipeBody(up, res, tap) {
 }
 
 /**
- * Run `fn(account)` trying accounts in round-robin order with failover:
- * concurrent_session that survives the auto-reset, or auth errors, move to
- * the next account. Non-account errors propagate immediately.
- *
- * `ctx` accumulates per-request facts (account, attempts, failovers) that the
- * access log reports, and marks each attempt in flight until it settles.
+ * Run `fn(account)` trying accounts in round-robin order with failover.
+ * Account-issue errors (concurrent_session, concurrent, ads_required after
+ * recovery, auth) move to the next account; busy accounts (at the in-flight
+ * cap) are skipped without spending an upstream attempt. If every account is
+ * busy, wait briefly for a free slot instead of hammering upstream. At most
+ * two rounds, and never more than config.maxTotalAttempts upstream attempts.
  */
+const ACCOUNT_ISSUE_CODES = new Set(['concurrent_session', 'concurrent', 'auth', 'ads_required']);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function withFailover(fn, { path, rid, ctx }) {
-  const order = pickOrder();
-  if (ctx) ctx.tried = [];
+  const isBusy = (a) => inFlightCount(a.id) >= config.maxInFlightPerAccount;
+  const maxTotal = config.maxTotalAttempts ?? 10;
   let lastErr;
-  for (let i = 0; i < order.length; i++) {
-    const account = order[i];
-    const release = beginRequest(account);
-    if (ctx) ctx.account = account.id;
-    const live = inFlightCount(account.id);
-    if (live >= config.maxInFlightPerAccount) {
-      log.warn('account at session limit', { rid, path, account: account.id, inFlight: live });
+
+  for (let round = 0; round < 2; round++) {
+    if (round > 0) {
+      if (!(lastErr instanceof UpstreamError) || !ACCOUNT_ISSUE_CODES.has(lastErr.code)) throw lastErr;
+      if ((ctx?.attempts ?? 0) >= maxTotal) throw lastErr;
+      log.info('all accounts hit account issues, one more round after backoff', { rid, path, wait: 1500 });
+      await sleep(1500);
     }
-    try {
-      const result = await fn(account);
-      return result;
-    } catch (err) {
-      lastErr = err;
-      if (ctx) {
-        ctx.tried.push({ account: account.id, error: err.code ?? err.message });
-        if (err.attempts) ctx.attempts = (ctx.attempts ?? 0) + err.attempts;
+
+    // if every account is busy, wait (bounded) for a free slot first
+    if (pickOrder().every(isBusy)) {
+      const deadline = Date.now() + (config.busyWaitMs ?? 15_000);
+      log.info('all accounts busy, waiting for a free slot', { rid, path, waitUntilCap: config.busyWaitMs ?? 15_000 });
+      while (Date.now() < deadline && pickOrder().every(isBusy)) await sleep(250);
+    }
+
+    for (const account of pickOrder()) {
+      if (isBusy(account)) {
+        if (ctx) ctx.tried.push({ account: account.id, error: 'busy-skipped' });
+        continue;
       }
-      const retryableAccountIssue =
-        err instanceof UpstreamError && (err.code === 'concurrent_session' || err.code === 'auth');
-      if (!retryableAccountIssue || i === order.length - 1) throw err;
-      if (ctx) ctx.failovers = (ctx.failovers ?? 0) + 1;
-      log.warn('failing over to next account', { rid, path, from: account.id, reason: err.code ?? err.message });
-    } finally {
-      release();
+      const release = beginRequest(account);
+      if (ctx) ctx.account = account.id;
+      try {
+        return await fn(account);
+      } catch (err) {
+        lastErr = err;
+        if (ctx) ctx.tried.push({ account: account.id, error: err.code ?? err.message });
+        const accountIssue = err instanceof UpstreamError && ACCOUNT_ISSUE_CODES.has(err.code);
+        if (!accountIssue || (ctx?.attempts ?? 0) >= maxTotal) throw err;
+        if (ctx) ctx.failovers = (ctx.failovers ?? 0) + 1;
+        log.warn('failing over to next account', { rid, path, from: account.id, reason: err.code ?? err.message });
+        // the account is mid-request elsewhere: brief pause before the next one
+        if (err.code === 'concurrent' || err.code === 'concurrent_session') await sleep(300);
+      } finally {
+        release();
+      }
     }
   }
   throw lastErr;
@@ -111,12 +142,13 @@ function recordOutcome(accountId, path, status, started, extra = {}) {
 // ---- route handlers ---------------------------------------------------------
 async function handleChatCompletions(req, res, rid, ctx) {
   const raw = await readBody(req);
+  const signal = clientAbort(res);
   const streaming = (req.headers.accept ?? '').includes('text/event-stream') || raw.toString().includes('"stream":true');
 
   return withFailover(async (account) => {
     const started = Date.now();
     const up = await upstream('/v1/chat/completions', {
-      method: 'POST', body: raw, account, onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
+      method: 'POST', body: raw, account, signal, onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
     });
 
     if (!streaming) {
@@ -162,13 +194,14 @@ async function handleChatCompletions(req, res, rid, ctx) {
 
 async function handleMessages(req, res, rid, ctx) {
   const body = JSON.parse((await readBody(req)).toString() || '{}');
+  const signal = clientAbort(res);
   await getCatalog(primaryAccount());
   const oai = anthropicToOpenAI(body);
 
   return withFailover(async (account) => {
     const started = Date.now();
     const up = await upstream('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(oai), account, headers: { accept: 'application/json' },
+      method: 'POST', body: JSON.stringify(oai), account, headers: { accept: 'application/json' }, signal,
       onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
     });
     if (!up.ok) throw new UpstreamError(up.status, await up.text().catch(() => ''));

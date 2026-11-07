@@ -11,9 +11,13 @@ export class UpstreamError extends Error {
     this.status = status;
     this.body = body;
     this.attempts = attempts ?? 1;
-    this.code = body?.includes('concurrent_session') ? 'concurrent_session'
-      : body?.includes('invalid_token') || status === 401 ? 'auth'
-      : undefined;
+    // parse the structured error code ("concurrent", "concurrent_session",
+    // "ads_required", "context_too_long", ...) from the JSON body
+    let code;
+    try { code = JSON.parse(body)?.code; } catch {}
+    this.code = code
+      ?? (body?.includes('concurrent_session') ? 'concurrent_session' : undefined);
+    if (status === 401 || body?.includes('invalid_token')) this.code = 'auth';
   }
 }
 
@@ -50,32 +54,39 @@ export function fingerprintHeaders(account, extra = {}, path = '') {
 
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
+/** Backoff with ±50% jitter, capped. */
+const jitter = (ms) => Math.min(Math.round(ms * (0.5 + Math.random())), 30_000);
+
+/** Sleep that wakes early (rejecting with AbortError) when `signal` fires. */
+function sleep(ms, signal) {
+  if (signal?.aborted) return Promise.reject(new DOMException('aborted', 'AbortError'));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('aborted', 'AbortError')); }, { once: true });
+  });
+}
+
+/** Client signal (if any) + the per-request hard timeout. */
+const mergedSignal = (signal) => signal
+  ? AbortSignal.any([signal, AbortSignal.timeout(config.requestTimeoutMs)])
+  : AbortSignal.timeout(config.requestTimeoutMs);
+
 // User-Agent the CLI's agent engine sends on chat completions (captured from a
 // real `npx free-pi-cli@latest` session): pi/<engine> (<platform>; node/<ver>; <arch>)
 const PI_ENGINE_VERSION = config.piEngineVersion ?? '1.5.0';
 const PI_USER_AGENT = `pi/${PI_ENGINE_VERSION} (${process.platform}; node/${process.version}; ${process.arch})`;
 
-// Fields some clients send that upstream models may not support (reasoning controls).
-const REASONING_FIELDS = [
-  'reasoning_effort', 'reasoning', 'thinking', 'thinking_budget',
-  'enable_thinking', 'include_reasoning', 'reasoning_content',
-  'chat_template_kwargs',
-];
+// Reasoning controls are normalized in reasoning.js: client intent (Anthropic
+// thinking, enable_thinking, chat_template_kwargs, OpenAI reasoning) is mapped
+// to `reasoning_effort`, which upstream accepts and answers with reasoning_content.
+import { normalizeOpenAIReasoning, stripAllReasoning } from './reasoning.js';
 
-/** Strip reasoning-control fields from an OpenAI chat body (JSON string/Buffer in, out). */
-function stripReasoningControls(rawBody) {
+function parseBody(rawBody) {
   try {
     const raw = Buffer.isBuffer(rawBody) ? rawBody.toString() : rawBody;
-    const body = JSON.parse(raw);
-    const stripped = [];
-    for (const k of REASONING_FIELDS) {
-      if (k in body) { delete body[k]; stripped.push(k); }
-    }
-    if (!stripped.length) return { body: rawBody, stripped };
-    log.info('stripped unsupported reasoning controls', { fields: stripped });
-    return { body: JSON.stringify(body), stripped };
+    return { raw, parsed: JSON.parse(raw) };
   } catch {
-    return { body: rawBody, stripped: [] };
+    return { raw: rawBody, parsed: null };
   }
 }
 
@@ -103,28 +114,48 @@ export async function upstream(path, opts = {}) {
   let resets = 0;
   let reasoningStripped = false;
   let adCycles = 0;
+  let timeouts = 0;
+  const maxTimeoutRetries = config.retry.timeoutRetries ?? 1;
 
-  // Proactively drop reasoning controls on chat bodies (some upstream models reject them).
+  // Normalize reasoning controls on chat bodies: client intent -> reasoning_effort.
   if (opts.body && path.includes('/chat/completions')) {
-    const { body, stripped } = stripReasoningControls(opts.body);
-    if (stripped.length) { opts = { ...opts, body }; reasoningStripped = true; }
+    const { raw, parsed } = parseBody(opts.body);
+    if (parsed) {
+      const { dropped, effort } = normalizeOpenAIReasoning(parsed);
+      if (dropped.length || effort) {
+        if (dropped.length) log.info('normalized reasoning controls', { fields: dropped, effort });
+        opts = { ...opts, body: JSON.stringify(parsed) };
+        reasoningStripped = dropped.length > 0;
+      }
+    } else if (raw !== opts.body) {
+      opts = { ...opts, body: raw };
+    }
   }
 
   for (let attempt = 1; ; attempt++) {
+    // client cancellation is never retried
+    if (opts.signal?.aborted) {
+      throw new UpstreamError(499, '', 'client aborted', attempt);
+    }
+    opts.onAttempt?.(1); // every attempt counts, including retries
     let res;
     try {
-      res = await once(path, opts);
+      res = await once(path, { ...opts, signal: mergedSignal(opts.signal) });
     } catch (err) {
-      if (attempt < retries && err.name !== 'AbortError') {
-        const wait = config.retry.backoffMs * 2 ** (attempt - 1);
-        log.warn('upstream network error, retrying', { path, account: account.id, attempt, wait, error: err.message });
-        await new Promise((r) => setTimeout(r, wait));
+      if (opts.signal?.aborted) throw err; // client gone — do not retry
+      const isTimeout = err.name === 'TimeoutError';
+      const timeoutBudgetLeft = !isTimeout || timeouts < maxTimeoutRetries;
+      if (attempt < retries && timeoutBudgetLeft) {
+        if (isTimeout) timeouts++;
+        const wait = jitter(config.retry.backoffMs * 2 ** (attempt - 1));
+        log.warn('upstream network error, retrying', { path, account: account.id, attempt, wait, timeout: isTimeout, error: err.message });
+        await sleep(wait, opts.signal);
         continue;
       }
       throw err;
     }
 
-    if (res.ok) { opts.onAttempt?.(attempt); return res; }
+    if (res.ok) return res;
 
     const errText = await res.text().catch(() => '');
 
@@ -158,21 +189,33 @@ export async function upstream(path, opts = {}) {
       continue;
     }
 
-    // Upstream rejected reasoning controls we didn't catch up front -> strip and retry once.
+    // Upstream still rejected reasoning controls -> strip them entirely and retry once.
     if (res.status === 400 && /reasoning|thinking/i.test(errText) && !reasoningStripped && opts.body) {
-      const { body } = stripReasoningControls(opts.body);
-      if (body !== (Buffer.isBuffer(opts.body) ? opts.body.toString() : opts.body)) {
-        log.warn('upstream 400 reasoning controls, retrying without them', { path, account: account.id });
-        opts = { ...opts, body };
-        reasoningStripped = true;
-        continue;
+      const { parsed } = parseBody(opts.body);
+      if (parsed) {
+        const dropped = stripAllReasoning(parsed);
+        if (dropped.length) {
+          log.warn('upstream 400 reasoning controls, retrying without them', { path, account: account.id, dropped });
+          opts = { ...opts, body: JSON.stringify(parsed) };
+          reasoningStripped = true;
+          continue;
+        }
       }
     }
 
+    // honor Retry-After on 429 before the generic backoff path
+    if (res.status === 429 && attempt < retries) {
+      const ra = Number(res.headers.get('retry-after'));
+      const wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 30_000) : jitter(config.retry.backoffMs * 2 ** (attempt - 1));
+      log.warn('upstream 429, backing off', { path, account: account.id, attempt, wait, retryAfter: Number.isFinite(ra) ? ra : undefined });
+      await sleep(wait, opts.signal);
+      continue;
+    }
+
     if (RETRYABLE.has(res.status) && attempt < retries) {
-      const wait = config.retry.backoffMs * 2 ** (attempt - 1);
+      const wait = jitter(config.retry.backoffMs * 2 ** (attempt - 1));
       log.warn('upstream retryable status, retrying', { path, account: account.id, status: res.status, attempt, wait });
-      await new Promise((r) => setTimeout(r, wait));
+      await sleep(wait, opts.signal);
       continue;
     }
     throw new UpstreamError(res.status, errText, undefined, attempt);

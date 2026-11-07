@@ -70,33 +70,61 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage) {
         if (choice.finish_reason) stop = mapStop(choice.finish_reason);
         const delta = choice.delta ?? {};
 
+        if (delta.reasoning_content) emitThinking(send, blocks, delta.reasoning_content);
         if (delta.content) emitText(send, blocks, delta.content);
         for (const tc of delta.tool_calls ?? []) emitToolDelta(send, blocks, tc);
-        if (delta.reasoning_content) emitText(send, blocks, ''); // ignore reasoning text
       }
     }
   } catch (err) {
     streamError = err;
     log.error('stream translation failed mid-flight', { error: err.message });
-    send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${err.message}` } });
   } finally {
-    for (const b of blocks) send('content_block_stop', { type: 'content_block_stop', index: b.index });
-    const outFinal = outTokens || estimateTokens(blocks);
-    send('message_delta', {
-      type: 'message_delta',
-      delta: { stop_reason: stop, stop_sequence: null },
-      usage: { output_tokens: outFinal, input_tokens: inTokens },
-    });
-    send('message_stop', { type: 'message_stop' });
-    onUsage?.({ inputTokens: inTokens, outputTokens: outFinal }, streamError);
+    clearInterval(ping);
+    if (streamError) {
+      // the response is incomplete — terminate with an error event, never a
+      // normal message_delta/message_stop that would make truncation look done
+      send('error', { type: 'error', error: { type: 'api_error', message: `stream interrupted: ${streamError.message}` } });
+    } else {
+      for (const b of blocks) if (!b.closed) send('content_block_stop', { type: 'content_block_stop', index: b.index });
+      const outFinal = outTokens || estimateTokens(blocks);
+      send('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: stop, stop_sequence: null },
+        usage: { output_tokens: outFinal, input_tokens: inTokens },
+      });
+      send('message_stop', { type: 'message_stop' });
+    }
+    onUsage?.({ inputTokens: inTokens, outputTokens: outTokens }, streamError);
     finish();
   }
 }
 
+function closeLast(send, blocks) {
+  const last = blocks[blocks.length - 1];
+  if (last && !last.closed) {
+    last.closed = true;
+    send('content_block_stop', { type: 'content_block_stop', index: last.index });
+  }
+}
+
+function emitThinking(send, blocks, text) {
+  if (!text) return;
+  let b = blocks[blocks.length - 1];
+  if (!b || b.type !== 'thinking' || b.closed) {
+    closeLast(send, blocks);
+    b = { type: 'thinking', index: blocks.length, text: '' };
+    blocks.push(b);
+    send('content_block_start', { type: 'content_block_start', index: b.index, content_block: { type: 'thinking', thinking: '' } });
+  }
+  b.text += text;
+  send('content_block_delta', { type: 'content_block_delta', index: b.index, delta: { type: 'thinking_delta', thinking: text } });
+}
+
 function emitText(send, blocks, text) {
   if (!text) return;
-  let b = blocks.find((x) => x.type === 'text');
-  if (!b) {
+  let b = blocks[blocks.length - 1];
+  if (!b || b.type !== 'text' || b.closed) {
+    closeLast(send, blocks);
     b = { type: 'text', index: blocks.length, text: '' };
     blocks.push(b);
     send('content_block_start', { type: 'content_block_start', index: b.index, content_block: { type: 'text', text: '' } });
@@ -108,6 +136,7 @@ function emitText(send, blocks, text) {
 function emitToolDelta(send, blocks, tc) {
   let b = blocks.find((x) => x.type === 'tool_use' && x.oaiIndex === tc.index);
   if (!b) {
+    closeLast(send, blocks);
     b = { type: 'tool_use', oaiIndex: tc.index, index: blocks.length, id: tc.id, name: tc.function?.name ?? '', json: '' };
     blocks.push(b);
     send('content_block_start', {
@@ -138,11 +167,15 @@ async function emitWhole(oai, requestModel, res, onUsage) {
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   send('message_start', { type: 'message_start', message: { ...msg, content: [] } });
   msg.content.forEach((block, index) => {
-    send('content_block_start', { type: 'content_block_start', index, content_block: block.type === 'tool_use' ? { type: 'tool_use', id: block.id, name: block.name, input: {} } : { type: 'text', text: '' } });
-    if (block.type === 'text' && block.text) {
-      send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } });
+    if (block.type === 'thinking') {
+      send('content_block_start', { type: 'content_block_start', index, content_block: { type: 'thinking', thinking: '' } });
+      if (block.thinking) send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: block.thinking } });
     } else if (block.type === 'tool_use') {
+      send('content_block_start', { type: 'content_block_start', index, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } });
       send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } });
+    } else {
+      send('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+      if (block.text) send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } });
     }
     send('content_block_stop', { type: 'content_block_stop', index });
   });
