@@ -2,11 +2,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { streamTranslate } from '../src/translate/stream.js';
-import { fakeRes, fakeUpstream, sseBody, delta } from './helpers.js';
+import { fakeRes, fakeUpstream, sseBody, rawBody, byteChunks, frame, delta } from './helpers.js';
 
 const run = async (chunks, opts = {}, resOpts = {}) => {
   const res = fakeRes(resOpts);
   await streamTranslate(fakeUpstream(sseBody(chunks)), 'test-model', res, () => {}, opts);
+  return res;
+};
+
+/** Drive the translator with a literal SSE body (exact framing control). */
+const runRaw = async (text, opts = {}) => {
+  const res = fakeRes();
+  await streamTranslate(fakeUpstream(rawBody(text)), 'test-model', res, () => {}, opts);
   return res;
 };
 
@@ -87,4 +94,99 @@ test('reasoning then text produces thinking and text blocks in order', async () 
   assert.match(res.out, /"type":"thinking"/);
   assert.match(res.out, /"type":"text"/);
   assert.ok(res.out.indexOf('"type":"thinking"') < res.out.indexOf('"type":"text"'));
+});
+// ---- SSE framing: the final delta must never be dropped ------------------
+
+test('a final data line with no trailing newline is still emitted', async () => {
+  // Some upstreams/proxies omit the newline on the last flush. Dropping that
+  // chunk loses content while still reporting a clean message_stop.
+  const res = await runRaw(frame(delta('hello')) + 'data: ' + JSON.stringify(delta('world')));
+  assert.equal(res.text, 'helloworld');
+  assert.equal(res.messageDelta.delta.stop_reason, 'end_turn');
+});
+
+test('an entire body with no newline at all is not discarded', async () => {
+  const res = await runRaw('data: ' + JSON.stringify(delta('LOST')));
+  assert.equal(res.text, 'LOST');
+  assert.ok(res.events.includes('message_stop'));
+});
+
+test('an unterminated final line still respects stop sequences', async () => {
+  const res = await runRaw(frame(delta('abc')) + 'data: ' + JSON.stringify(delta('STOPzzz')), {
+    stopSequences: ['STOP'],
+  });
+  assert.equal(res.text, 'abc');
+  assert.equal(res.messageDelta.delta.stop_reason, 'stop_sequence');
+  assert.equal(res.messageDelta.delta.stop_sequence, 'STOP');
+});
+
+test('a stop sequence in an unterminated final line leaves a well-formed stream', async () => {
+  const res = await runRaw('data: ' + JSON.stringify(delta('STOP')), { stopSequences: ['STOP'] });
+  assert.equal(res.text, '');
+  assert.equal(res.messageDelta.delta.stop_reason, 'stop_sequence');
+  // success path still terminates properly after a post-EOF hit
+  assert.ok(res.events.includes('message_stop'));
+  assert.ok(!res.events.includes('error'));
+  const starts = res.events.filter((e) => e === 'content_block_start').length;
+  const stops = res.events.filter((e) => e === 'content_block_stop').length;
+  assert.equal(starts, stops);
+});
+
+test('a trailing partial JSON line is ignored, not fatal', async () => {
+  const res = await runRaw(frame(delta('ok')) + 'data: {"choices":[{"delta":{"con');
+  assert.equal(res.text, 'ok');
+  assert.ok(res.events.includes('message_stop'));
+});
+
+test('CRLF framing is handled', async () => {
+  const res = await runRaw(
+    'data: ' + JSON.stringify(delta('a')) + '\r\n\r\n' +
+    'data: ' + JSON.stringify(delta('b')) + '\r\n\r\n',
+  );
+  assert.equal(res.text, 'ab');
+});
+
+test('a multi-byte character split across chunks is decoded, not mangled', async () => {
+  const enc = new TextEncoder();
+  const bytes = enc.encode(frame(delta('héllo ✓')));
+  const mid = Math.floor(bytes.length / 2);
+  const res = fakeRes();
+  await streamTranslate(
+    fakeUpstream(byteChunks([bytes.slice(0, mid), bytes.slice(mid)])),
+    'test-model', res, () => {}, {},
+  );
+  assert.equal(res.text, 'héllo ✓');
+});
+
+// ---- delta ordering -------------------------------------------------------
+
+test('reasoning emitted after text opens a separate thinking block', async () => {
+  const res = await run([
+    delta('answer '),
+    { choices: [{ delta: { reasoning_content: 'reconsider' } }] },
+    delta('more'),
+  ]);
+  const types = [...res.out.matchAll(/"type":"(text_delta|thinking_delta)"/g)].map((m) => m[1]);
+  assert.deepEqual(types, ['text_delta', 'thinking_delta', 'text_delta']);
+  assert.equal(res.text, 'answer more');
+});
+
+test('empty and whitespace-only deltas are handled correctly', async () => {
+  const res = await run([delta(''), delta(''), delta('x')]);
+  assert.equal(res.text, 'x');
+  assert.equal(res.events.filter((e) => e === 'content_block_start').length, 1);
+
+  const ws = await run([delta(' ')]);
+  assert.equal(ws.text, ' ');
+});
+
+test('usage-only and finish_reason-only chunks are both honoured', async () => {
+  const res = await run([
+    delta('hi'),
+    { choices: [{ delta: {}, finish_reason: 'length' }] },
+    { choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } },
+  ]);
+  assert.equal(res.messageDelta.delta.stop_reason, 'max_tokens');
+  assert.equal(res.messageDelta.usage.output_tokens, 5);
+  assert.equal(res.messageDelta.usage.input_tokens, 10);
 });

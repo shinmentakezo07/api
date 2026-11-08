@@ -98,6 +98,62 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
     else signal.addEventListener('abort', onAbort, { once: true });
   }
 
+  // Apply one already-framed SSE line. Shared by the read loop and the
+  // post-EOF flush of an unterminated final line, so both take one code path.
+  const handleLine = (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (payload === '[DONE]') return;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { return; }
+
+    if (chunk.usage) {
+      inTokens = chunk.usage.prompt_tokens ?? inTokens;
+      outTokens = chunk.usage.completion_tokens ?? outTokens;
+      cacheRead = chunk.usage.prompt_tokens_details?.cached_tokens ?? cacheRead;
+    }
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    if (choice.finish_reason) stop = mapStop(choice.finish_reason);
+    const delta = choice.delta ?? {};
+
+    if (delta.reasoning_content) emitThinking(send, blocks, delta.reasoning_content);
+    if (delta.content) {
+      // Stop sequences are enforced locally, but a match (or a partial one)
+      // can straddle chunk boundaries. With stop sequences in play, text
+      // goes through a pending buffer that only releases everything except
+      // the last (maxSeqLen - 1) chars — the longest string that could still
+      // turn out to be the start of a stop sequence. So the client never
+      // receives a stop sequence, and a truncated stream never leaks one.
+      if (stopSeqs.length) {
+        textPending += delta.content;
+        const hit = findStop(textPending, stopSeqs);
+        if (hit) {
+          // a match at index 0 truncates to empty text — still open the block
+          // so clients see an explicit (empty) text block rather than a
+          // message with no content at all, which reads as a refusal
+          flushText(send, blocks, textPending.slice(0, hit.idx), hit.idx === 0);
+          textPending = '';
+          stop = 'stop_sequence';
+          stopSequence = hit.seq;
+          log.info('stop sequence matched, truncating stream', { seq: hit.seq });
+          // reader may be undefined when the hit comes from the post-EOF flush
+          try { reader?.cancel().catch(() => {}); } catch {}
+          throw new StopSequenceHit(); // unwind to finally (not an error)
+        }
+        const keep = maxSeqLen - 1;
+        if (textPending.length > keep) {
+          const cut = textPending.length - keep;
+          flushText(send, blocks, textPending.slice(0, cut));
+          textPending = textPending.slice(cut);
+        }
+      } else {
+        emitText(send, blocks, delta.content);
+      }
+    }
+    for (const tc of delta.tool_calls ?? []) emitToolDelta(send, blocks, tc);
+  };
+
   try {
     reader = upstreamRes.body.getReader();
     const dec = new TextDecoder();
@@ -111,58 +167,15 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
       while ((nl = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, nl).trim();
         buffer = buffer.slice(nl + 1);
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        let chunk;
-        try { chunk = JSON.parse(payload); } catch { continue; }
-
-        if (chunk.usage) {
-          inTokens = chunk.usage.prompt_tokens ?? inTokens;
-          outTokens = chunk.usage.completion_tokens ?? outTokens;
-          cacheRead = chunk.usage.prompt_tokens_details?.cached_tokens ?? cacheRead;
-        }
-        const choice = chunk.choices?.[0];
-        if (!choice) continue;
-        if (choice.finish_reason) stop = mapStop(choice.finish_reason);
-        const delta = choice.delta ?? {};
-
-        if (delta.reasoning_content) emitThinking(send, blocks, delta.reasoning_content);
-        if (delta.content) {
-          // Stop sequences are enforced locally, but a match (or a partial one)
-          // can straddle chunk boundaries. With stop sequences in play, text
-          // goes through a pending buffer that only releases everything except
-          // the last (maxSeqLen - 1) chars — the longest string that could still
-          // turn out to be the start of a stop sequence. So the client never
-          // receives a stop sequence, and a truncated stream never leaks one.
-          if (stopSeqs.length) {
-            textPending += delta.content;
-            const hit = findStop(textPending, stopSeqs);
-            if (hit) {
-              // a match at index 0 truncates to empty text — still open the block
-              // so clients see an explicit (empty) text block rather than a
-              // message with no content at all, which reads as a refusal
-              flushText(send, blocks, textPending.slice(0, hit.idx), hit.idx === 0);
-              textPending = '';
-              stop = 'stop_sequence';
-              stopSequence = hit.seq;
-              log.info('stop sequence matched, truncating stream', { seq: hit.seq });
-              try { reader.cancel().catch(() => {}); } catch {}
-              throw new StopSequenceHit(); // unwind to finally (not an error)
-            }
-            const keep = maxSeqLen - 1;
-            if (textPending.length > keep) {
-              const cut = textPending.length - keep;
-              flushText(send, blocks, textPending.slice(0, cut));
-              textPending = textPending.slice(cut);
-            }
-          } else {
-            emitText(send, blocks, delta.content);
-          }
-        }
-        for (const tc of delta.tool_calls ?? []) emitToolDelta(send, blocks, tc);
+        handleLine(line);
       }
     }
+    // A stream can end without a trailing newline, leaving the last `data:`
+    // line in the buffer. Dropping it would lose a delta while still
+    // reporting a clean message_stop, so flush it through the same path.
+    // (A stop-sequence hit inside handleLine throws, so it unwinds to finally
+    // exactly as it would mid-loop.)
+    if (buffer.trim()) handleLine(buffer.trim());
   } catch (err) {
     if (err instanceof StopSequenceHit) {
       stoppedBySequence = true; // normal completion, handled in finally

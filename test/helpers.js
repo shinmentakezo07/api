@@ -54,6 +54,27 @@ export function sseBody(chunks) {
   });
 }
 
+/**
+ * A raw SSE body from a literal string, so tests control exact framing
+ * (missing trailing newline, CRLF, multi-byte splits).
+ */
+export function rawBody(text) {
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    start(c) { c.enqueue(enc.encode(text)); c.close(); },
+  });
+}
+
+/** A body delivered as exact byte slices, for split-encoding tests. */
+export function byteChunks(bytes) {
+  return new ReadableStream({
+    start(c) { for (const b of bytes) c.enqueue(b); c.close(); },
+  });
+}
+
+/** One OpenAI SSE frame, as a string. */
+export const frame = (obj) => 'data: ' + JSON.stringify(obj) + '\n\n';
+
 /** Fake upstream response object for the translators. */
 export function fakeUpstream(body, contentType = 'text/event-stream') {
   return { headers: { get: (k) => (k === 'content-type' ? contentType : null) }, body };
