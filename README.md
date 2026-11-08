@@ -104,11 +104,17 @@ cd repo-root
 docker compose up -d --build        # gateway on http://localhost:8787
 ```
 
-- State (accounts.json, logs, .admin-key) persists in the `freepi-data` volume
+- State (accounts.json, logs, .admin-key) persists in the `freepi-data` volume.
+  The container runs as the unprivileged `node` user, and `/app/data` is
+  created owned by it, so a fresh volume is writable without root.
 - Host `shi.json` is intentionally **not** baked into the image — configure via
   env vars instead: `ADMIN_KEY`, `PORT`, `HOST`, `DATA_DIR`,
   `FREEPI_CREDENTIALS_FILE`, `FREEPI_TOKEN_1..20` (in `.env`, picked up by
   `env_file`)
+- `PORT` is honoured end to end: the published mapping and the healthcheck both
+  follow it, so `PORT=9000` in `.env` serves on 9000. `docker compose up`
+  runs with `init: true`, so `docker stop` delivers SIGTERM to the gateway and
+  usage counters are flushed on shutdown.
 - Add your first account from the admin UI (`http://localhost:8787/admin`) via
   the GitHub login flow — it survives restarts in the volume
 - Optional: reuse the host CLI's signed-in account — uncomment the

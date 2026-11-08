@@ -5,4 +5,15 @@ accounts.json
 .admin-key
 logs/
 node_modules/
+
+# not needed to build or run the gateway
+test/
+package.json
 *.png
+.git/
+.gitignore
+docker-compose.yml
+Dockerfile
+.dockerignore
+README.md
+freepi-gateway.mjs

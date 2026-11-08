@@ -3,12 +3,15 @@ services:
     build: .
     image: freepi-gateway:latest
     container_name: freepi-gateway
+    # publish the same port the app listens on, so a PORT override in .env
+    # cannot desynchronise the mapping from the listening socket
     ports:
-      - "8787:8787"
+      - "${PORT:-8787}:${PORT:-8787}"
     environment:
       # container-specific settings (shi.json is intentionally not baked in)
       - HOST=0.0.0.0
       - DATA_DIR=/app/data
+      - PORT=${PORT:-8787}
       # Optional: reuse the host CLI's signed-in account as the fallback account.
       # If enabled, also uncomment the matching volume mount below.
       # - FREEPI_CREDENTIALS_FILE=/app/data/credentials.json
@@ -19,6 +22,10 @@ services:
       - freepi-data:/app/data
       # Optional: host CLI credentials as fallback account
       # - ${HOME}/.free-pi/agent/credentials.json:/app/data/credentials.json:ro
+    # Run an init as PID 1 so SIGTERM reaches node and shutdown hooks (which
+    # flush usage counters) run instead of being dropped.
+    init: true
+    stop_grace_period: 15s
     restart: unless-stopped
 
 volumes:
