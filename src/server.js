@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { config, configFileUsed, SESSION_ID } from './config.js';
 import { log } from './logger.js';
 import { upstream, UpstreamError, resetOtherSessions, fingerprintHeaders } from './upstream.js';
-import { pickOrder, primaryAccount, beginRequest, inFlightCount, inFlightAll } from './accounts.js';
+import { pickOrder, peekOrder, primaryAccount, beginRequest, inFlightCount, inFlightAll } from './accounts.js';
 import { record } from './usage.js';
 import { getCatalog, resolveModel, defaultModel } from './catalog.js';
 import { anthropicToOpenAI } from './translate/request.js';
@@ -68,11 +68,29 @@ function validateChatBody(body) {
   return null;
 }
 
-/** Abort signal that fires when the client disconnects before the response ends. */
+/**
+ * Abort signal that fires when the client disconnects before the response ends.
+ * The listener is removed once the request settles, so a long-lived keep-alive
+ * socket cannot accumulate one AbortController per failover attempt — each of
+ * which would otherwise abort (and log) on every later close.
+ */
 function clientAbort(res) {
   const ac = new AbortController();
-  res.on('close', () => { if (!res.writableEnded) ac.abort(new Error('client disconnected')); });
+  const onClose = () => { if (!res.writableEnded) ac.abort(new Error('client disconnected')); };
+  const cleanup = () => res.off('close', onClose);
+  res.on('close', onClose);
+  ac.signal.addEventListener('abort', cleanup, { once: true });
+  res.once('finish', cleanup);
   return ac.signal;
+}
+
+/** Resolve on the next 'drain', or when the socket closes. Always detaches. */
+function waitDrain(res) {
+  return new Promise((resolve) => {
+    const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+    res.once('drain', done);
+    res.once('close', done);
+  });
 }
 
 /**
@@ -90,12 +108,10 @@ async function pipeBody(up, res, tap) {
       bytes += value.byteLength;
       if (tap) tap(value);
       if (!res.write(value)) {
-        // wait for drain, but bail out if the client goes away instead
-        await new Promise((resolve) => {
-          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-          res.once('drain', done);
-          res.once('close', done);
-        });
+        // wait for drain, but bail out if the client goes away instead.
+        // Listeners are always detached — including when write() throws below,
+        // so a keep-alive socket never accumulates stale handlers.
+        await waitDrain(res);
         if (res.destroyed || res.writableEnded) throw new Error('client disconnected');
       }
     }
@@ -133,11 +149,12 @@ async function withFailover(fn, { path, rid, ctx }) {
       await sleep(1500);
     }
 
-    // if every account is busy, wait (bounded) for a free slot first
-    if (pickOrder().every(isBusy)) {
+    // if every account is busy, wait (bounded) for a free slot first.
+    // Probe with peekOrder(): it must not advance the round-robin cursor.
+    if (peekOrder().length && peekOrder().every(isBusy)) {
       const deadline = Date.now() + (config.busyWaitMs ?? 15_000);
       log.info('all accounts busy, waiting for a free slot', { rid, path, waitUntilCap: config.busyWaitMs ?? 15_000 });
-      while (Date.now() < deadline && pickOrder().every(isBusy)) await sleep(250);
+      while (Date.now() < deadline && peekOrder().length && peekOrder().every(isBusy)) await sleep(250);
     }
 
     for (const account of pickOrder()) {
@@ -166,11 +183,41 @@ async function withFailover(fn, { path, rid, ctx }) {
   throw lastErr;
 }
 
-/** Record a completed request, including a non-200 when the body was truncated. */
-function recordOutcome(accountId, path, status, started, extra = {}) {
+/**
+ * Record a completed request, including a non-200 when the body was truncated.
+ * Sets ctx.recorded so the router's catch-all doesn't count the same request
+ * a second time when a handler records and then throws.
+ */
+function recordOutcome(ctx, accountId, path, status, started, extra = {}) {
   record(accountId, { path, status, ms: Date.now() - started, ...extra });
+  if (ctx) ctx.recorded = true;
 }
 
+// ---- state machines -----------------------------------------------------------
+// These are implicit: they're enforced by convention across the three files below,
+// not by types. Keep them in sync when changing request handling.
+//
+// A. REQUEST LIFECYCLE (this file). Per request: ctx = { attempts, failovers,
+//    account, tried, streamError, recorded }. Exactly ONE usage row is written
+//    per client request. recordOutcome() sets ctx.recorded so the router's
+//    catch-all skips its own record() on the same request; a handler that
+//    records and then rethrows must therefore call recordOutcome, never record().
+//
+// B. FAILOVER (withFailover). Order comes from pickOrder(), which ADVANCES the
+//    round-robin cursor — call it exactly once per attempt loop. Busy/availability
+//    probes use peekOrder(), which is pure; using pickOrder() there skews
+//    distribution. Account-issue codes may trigger a 2nd round; all other errors
+//    propagate immediately. inFlight is incremented by beginRequest() and released
+//    in the finally block, so a thrown attempt can never leak a session slot.
+//
+// C. RESPONSE WRITE (pipeBody + handlers). Headers are irreversible: after
+//    writeHead() a failure can no longer be reported as a 5xx. Streaming
+//    therefore writes a 200 SSE head and reports later failures as an in-band
+//    error event with a 502 usage row; non-streaming buffers the whole body
+//    first so a broken copy still yields a real 502. Backpressure waits
+//    (waitDrain) always detach their listeners, and clientAbort() listeners are
+//    removed on settle so keep-alive sockets don't accumulate aborts.
+// -------------------------------------------------------------------------------
 // ---- route handlers ---------------------------------------------------------
 async function handleChatCompletions(req, res, rid, ctx) {
   const raw = await readBody(req);
@@ -198,20 +245,40 @@ async function handleChatCompletions(req, res, rid, ctx) {
     });
 
     if (!streaming) {
+      // Buffer the whole (small) JSON body before writing any header: once the
+      // status line is out, a broken body copy can no longer be reported as an
+      // error, and the client would see a truncated 200.
       const headers = Object.fromEntries(up.headers.entries());
       for (const h of ['content-encoding', 'content-length', 'transfer-encoding']) delete headers[h];
-      res.writeHead(up.status, { ...headers, ...CORS });
       let text = '';
-      const pipe = await pipeBody(up, res, (buf) => { text += buf.toString(); });
+      const reader = up.body.getReader();
+      const limit = config.maxBufferedBytes ?? 32 * 1024 * 1024;
+      let bytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          // the body is held in memory until complete: never let a runaway
+          // response exhaust the heap (same discipline as maxBodyBytes)
+          if (bytes > limit) throw new Error(`response body exceeds ${limit} bytes`);
+          text += Buffer.from(value).toString();
+        }
+      } catch (err) {
+        try { reader.cancel().catch(() => {}); } catch {}
+        log.error('response body copy failed', { rid, path: '/v1/chat/completions', account: account.id, bytes, error: err.message });
+        if (ctx) ctx.streamError = err.message;
+        recordOutcome(ctx, account.id, '/v1/chat/completions', 502, started, { error: `body copy failed after ${bytes}B: ${err.message}` });
+        throw new UpstreamError(502, '', `response body copy failed: ${err.message}`);
+      }
       const m = text.match(/"prompt_tokens":\s*(\d+)/);
       const m2 = text.match(/"completion_tokens":\s*(\d+)/);
-      if (!pipe.ok) {
-        log.error('response body copy failed', { rid, path: '/v1/chat/completions', account: account.id, bytes: pipe.bytes, error: pipe.error.message });
-        if (ctx) ctx.streamError = pipe.error.message;
-      }
-      recordOutcome(account.id, '/v1/chat/completions', pipe.ok ? up.status : 502, started, {
+      // the whole body is known now, so advertise its exact length instead of
+      // forcing chunked encoding (lets clients fail fast and detect truncation)
+      res.writeHead(up.status, { ...headers, 'content-length': String(Buffer.byteLength(text)), ...CORS });
+      res.end(text);
+      recordOutcome(ctx, account.id, '/v1/chat/completions', up.status, started, {
         inputTokens: m ? +m[1] : 0, outputTokens: m2 ? +m2[1] : 0,
-        ...(pipe.ok ? {} : { error: `body copy failed after ${pipe.bytes}B: ${pipe.error.message}` }),
       });
       return;
     }
@@ -254,7 +321,7 @@ async function handleChatCompletions(req, res, rid, ctx) {
       log.error('stream interrupted mid-flight', { rid, path: '/v1/chat/completions', account: account.id, bytes: pipe.bytes, error: pipe.error.message });
       if (ctx) ctx.streamError = pipe.error.message;
     }
-    recordOutcome(account.id, '/v1/chat/completions', pipe.ok ? (sawUpstreamError ? 502 : 200) : 502, started, {
+    recordOutcome(ctx, account.id, '/v1/chat/completions', pipe.ok ? (sawUpstreamError ? 502 : 200) : 502, started, {
       inputTokens: inTok, outputTokens: outTok,
       ...(pipe.ok ? (sawUpstreamError ? { error: 'upstream sent error mid-stream' } : {}) : { error: `streaming interrupted after ${pipe.bytes}B: ${pipe.error.message}` }),
     });
@@ -284,7 +351,7 @@ async function handleMessages(req, res, rid, ctx) {
     if (oai.stream) {
       return streamTranslate(up, body.model, res, (usage, streamError) => {
         if (streamError && ctx) ctx.streamError = streamError.message;
-        recordOutcome(account.id, '/v1/messages', streamError ? 502 : 200, started, {
+        recordOutcome(ctx, account.id, '/v1/messages', streamError ? 502 : 200, started, {
           model: oai.model, ...usage,
           ...(streamError ? { error: `streaming interrupted: ${streamError.message}` } : {}),
         });
@@ -300,7 +367,7 @@ async function handleMessages(req, res, rid, ctx) {
       }
       throw err;
     }
-    recordOutcome(account.id, '/v1/messages', 200, started, {
+    recordOutcome(ctx, account.id, '/v1/messages', 200, started, {
       model: oai.model, inputTokens: msg.usage.input_tokens, outputTokens: msg.usage.output_tokens,
     });
     log.info('messages ok', { rid, account: account.id, model: oai.model, in: msg.usage.input_tokens, out: msg.usage.output_tokens, stop: msg.stop_reason });
@@ -309,7 +376,9 @@ async function handleMessages(req, res, rid, ctx) {
 }
 
 async function handleCountTokens(req, res) {
-  const body = JSON.parse((await readBody(req)).toString() || '{}');
+  let body;
+  try { body = JSON.parse((await readBody(req)).toString() || '{}'); }
+  catch { return json(res, 400, errorBody(true, 400, 'request body is not valid JSON')); }
   const chars = JSON.stringify(body.messages ?? []).length + JSON.stringify(body.system ?? '').length;
   return json(res, 200, { input_tokens: Math.ceil(chars / 4) });
 }
@@ -363,7 +432,7 @@ export function createServer() {
     const rid = randomUUID().slice(0, 8);
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
     const route = matchRoute(req.method, url.pathname);
-    const ctx = { attempts: 0, failovers: 0, account: null, tried: [], streamError: null };
+    const ctx = { attempts: 0, failovers: 0, account: null, tried: [], streamError: null, recorded: false };
 
     if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
 
@@ -389,7 +458,9 @@ export function createServer() {
         : Number.isInteger(err.status) ? err.status
         : err.message?.includes('no enabled accounts') ? 503 : 502;
       const detail = err instanceof UpstreamError ? err.body || err.message : err.message;
-      record(ctx.account ?? 'gateway', { path: url.pathname, status, ms: Date.now() - started, error: detail });
+      // a handler that already recorded this request (e.g. a failed body copy,
+      // then rethrow) must not be counted twice
+      if (!ctx.recorded) record(ctx.account ?? 'gateway', { path: url.pathname, status, ms: Date.now() - started, error: detail });
       log.error('route failed', { rid, path: url.pathname, status, error: err.message, account: ctx.account, attempts: ctx.attempts, upstreamBody: String(detail).slice(0, 800) });
       if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json', ...CORS });
       if (!res.writableEnded) res.end(JSON.stringify(errorBody(route.anthropic, status, detail)));

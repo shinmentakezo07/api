@@ -106,7 +106,7 @@ export function initAccounts() {
   log.info('accounts loaded', { total: accounts.length, enabled: enabledAccounts().length, sources: accounts.map(a => a.source).join(',') });
 }
 
-function enabledAccounts() {
+export function enabledAccounts() {
   return accounts.filter((a) => a.enabled);
 }
 
@@ -116,6 +116,18 @@ export function pickOrder() {
   if (list.length === 0) throw new Error('no enabled accounts configured');
   const primary = rrIndex % list.length;
   rrIndex = (rrIndex + 1) % Math.max(list.length, 1);
+  return [list[primary], ...list.filter((_, i) => i !== primary)];
+}
+
+/**
+ * Pure predicate order — same selection `pickOrder()` would make, without
+ * advancing the round-robin cursor. Use for busy/availability checks, which
+ * must not perturb request distribution.
+ */
+export function peekOrder() {
+  const list = enabledAccounts();
+  if (list.length === 0) return [];
+  const primary = rrIndex % list.length;
   return [list[primary], ...list.filter((_, i) => i !== primary)];
 }
 

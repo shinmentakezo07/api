@@ -27,6 +27,7 @@ const DEFAULTS = {
   catalogTtlMs: 300_000,
   retry: { maxAttempts: 3, backoffMs: 500, timeoutRetries: 1 },   // on 429/5xx, before first byte sent; timeouts get their own small budget
   maxTotalAttempts: 10,        // global cap on upstream attempts per client request (across accounts)
+  maxBufferedBytes: 32 * 1024 * 1024, // non-streaming responses are buffered whole; reject beyond this
   busyWaitMs: 15_000,          // when every account is at its in-flight cap, wait up to this for a free slot
   resetOnConcurrent: { maxResets: 2, settleMs: 500 }, // auto /close-other-session on concurrent_session
   credRefreshMs: 60_000,       // re-read credentials.json at most this often

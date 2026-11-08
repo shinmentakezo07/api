@@ -7,12 +7,38 @@ const estimateTokens = (blocks) =>
 
 /** Internal signal: a requested stop sequence matched — a normal, complete end. */
 class StopSequenceHit extends Error {
-  constructor() { super('stop sequence matched'); this.isStopHit = true; }
+  constructor() { super('stop sequence matched'); }
 }
 
 /**
  * Consume an OpenAI chat-completions SSE stream and re-emit it as an
  * Anthropic Messages SSE stream on `res`.
+ *
+ * STATE MACHINES (all enforced here, none by the type system)
+ * ----------------------------------------------------------
+ * 1. Anthropic block protocol. Anthropic allows exactly ONE open content block
+ *    at a time, while OpenAI interleaves deltas by index. Invariants:
+ *      - any new block first calls closeActive(), so block N stops before N+1
+ *      - every opened block receives exactly one content_block_stop
+ *      - a re-opened tool call (out-of-order parallel deltas) is emitted as a
+ *        NEW block with the same id; Anthropic cannot reopen a closed block
+ *    The `blocks` array order IS the wire order; never push without emitting
+ *    the corresponding content_block_start.
+ *
+ * 2. Stop-sequence hold-back. When stop sequences are configured, text passes
+ *    through `textPending` and only the last (maxSeqLen - 1) chars are held
+ *    back, the longest prefix that could still become a stop sequence. The
+ *    tail is released on normal end; on a stop hit `textPending` is cleared,
+ *    and on error it is dropped deliberately (the response is already reported
+ *    as incomplete). Never emit text that bypasses this buffer.
+ *
+ * 3. Terminal state: success XOR error. A set `streamError` emits an `error`
+ *    event and NO message_delta/message_stop; otherwise the normal close
+ *    sequence runs. Emitting message_stop after an error would make a
+ *    truncated response look complete to the client.
+ *
+ * 4. Disconnect. `opts.signal` cancels the upstream reader so a session slot is
+ *    released immediately instead of at the request timeout.
  */
 export async function streamTranslate(upstreamRes, requestModel, res, onUsage, opts = {}) {
   const contentType = upstreamRes.headers.get('content-type') ?? '';
@@ -47,6 +73,11 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
   let buffer = '';
   let streamError = null;
   let stoppedBySequence = false;
+  // stop-sequence handling: text is held back by (maxSeqLen - 1) chars so a
+  // straddling match is never emitted to the client before it is detected
+  const stopSeqs = (opts.stopSequences ?? []).filter((s) => typeof s === 'string' && s.length > 0);
+  const maxSeqLen = stopSeqs.reduce((n, s) => Math.max(n, s.length), 0);
+  let textPending = '';
 
   const ping = setInterval(() => send('ping', { type: 'ping' }), 15_000);
   const finish = () => { clearInterval(ping); try { res.end(); } catch {} };
@@ -98,30 +129,35 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
 
         if (delta.reasoning_content) emitThinking(send, blocks, delta.reasoning_content);
         if (delta.content) {
-          emitText(send, blocks, delta.content);
-          // local stop-sequence enforcement: truncate at the first match and
-          // finish the message with stop_reason "stop_sequence"
-          if (opts.stopSequences?.length) {
-            const full = blocks.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
-            for (const seq of opts.stopSequences) {
-              if (!seq) continue;
-              const idx = full.indexOf(seq);
-              if (idx !== -1) {
-                // truncate the block that contains the match
-                let off = 0;
-                for (const b of blocks) {
-                  if (b.type !== 'text') continue;
-                  const start = off, end = off + (b.text ?? '').length;
-                  if (idx >= start && idx <= end) b.text = (b.text ?? '').slice(0, idx - start);
-                  off = end;
-                }
-                stop = 'stop_sequence';
-                stopSequence = seq;
-                log.info('stop sequence matched, truncating stream', { seq });
-                try { reader.cancel().catch(() => {}); } catch {}
-                throw new StopSequenceHit(); // unwind to finally (not an error)
-              }
+          // Stop sequences are enforced locally, but a match (or a partial one)
+          // can straddle chunk boundaries. With stop sequences in play, text
+          // goes through a pending buffer that only releases everything except
+          // the last (maxSeqLen - 1) chars — the longest string that could still
+          // turn out to be the start of a stop sequence. So the client never
+          // receives a stop sequence, and a truncated stream never leaks one.
+          if (stopSeqs.length) {
+            textPending += delta.content;
+            const hit = findStop(textPending, stopSeqs);
+            if (hit) {
+              // a match at index 0 truncates to empty text — still open the block
+              // so clients see an explicit (empty) text block rather than a
+              // message with no content at all, which reads as a refusal
+              flushText(send, blocks, textPending.slice(0, hit.idx), hit.idx === 0);
+              textPending = '';
+              stop = 'stop_sequence';
+              stopSequence = hit.seq;
+              log.info('stop sequence matched, truncating stream', { seq: hit.seq });
+              try { reader.cancel().catch(() => {}); } catch {}
+              throw new StopSequenceHit(); // unwind to finally (not an error)
             }
+            const keep = maxSeqLen - 1;
+            if (textPending.length > keep) {
+              const cut = textPending.length - keep;
+              flushText(send, blocks, textPending.slice(0, cut));
+              textPending = textPending.slice(cut);
+            }
+          } else {
+            emitText(send, blocks, delta.content);
           }
         }
         for (const tc of delta.tool_calls ?? []) emitToolDelta(send, blocks, tc);
@@ -142,6 +178,13 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
     if (!streamError) {
       try { flushPendingToolDeltas(send, blocks); }
       catch (e) { streamError = e; log.error('failed to flush buffered tool deltas', { error: e.message }); }
+    }
+    // normal end: the held-back tail was never a stop sequence — release it.
+    // On a stop-sequence hit textPending is already empty. On an error the
+    // response is reported as incomplete, so the tail is deliberately dropped.
+    if (!streamError && textPending) {
+      flushText(send, blocks, textPending);
+      textPending = '';
     }
     // validate accumulated tool-call JSON before declaring success — never let
     // a client execute a tool with truncated/garbled arguments. Arguments can be
@@ -212,6 +255,26 @@ function backpressureSend(res) {
   return send;
 }
 
+/** First stop-sequence match in `text`: { seq, idx } (earliest wins) or null. */
+function findStop(text, seqs) {
+  let best = null;
+  for (const seq of seqs) {
+    const idx = text.indexOf(seq);
+    if (idx !== -1 && (!best || idx < best.idx)) best = { seq, idx };
+  }
+  return best;
+}
+
+/**
+ * Emit buffered stop-sequence text (truncation already applied by caller).
+ * `openEmpty` forces a block even when there is no text, so an immediately
+ * truncated stream still yields a well-formed (empty) content block.
+ */
+function flushText(send, blocks, text, openEmpty = false) {
+  if (text) emitText(send, blocks, text);
+  else if (openEmpty) emitText(send, blocks, '', true);
+}
+
 function closeActive(send, blocks) {
   const b = blocks.find((x) => !x.closed);
   if (b) {
@@ -235,8 +298,8 @@ function emitThinking(send, blocks, text) {
 
 const openBlockLocal = (blocks) => blocks.find((x) => !x.closed);
 
-function emitText(send, blocks, text) {
-  if (!text) return;
+function emitText(send, blocks, text, openEmpty = false) {
+  if (!text && !openEmpty) return;
   let b = openBlockLocal(blocks);
   if (!b || b.type !== 'text') {
     closeActive(send, blocks);
@@ -245,7 +308,7 @@ function emitText(send, blocks, text) {
     send('content_block_start', { type: 'content_block_start', index: b.index, content_block: { type: 'text', text: '' } });
   }
   b.text = (b.text ?? '') + text;
-  send('content_block_delta', { type: 'content_block_delta', index: b.index, delta: { type: 'text_delta', text } });
+  if (text || openEmpty) send('content_block_delta', { type: 'content_block_delta', index: b.index, delta: { type: 'text_delta', text } });
 }
 
 function emitToolDelta(send, blocks, tc) {

@@ -77,7 +77,25 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 | `retry` | 3 × 500ms | 429/5xx backoff retries |
 | `logRotate` | 10 MiB × 5 | size-based rotation of `gateway.log` (`gateway.log` → `gateway.1.log` …) |
 | `maxInFlightPerAccount` | 4 | free-pi session limit; logs `account at session limit` when reached |
+| `maxBufferedBytes` | 32 MiB | cap on a non-streaming response held in memory before it is sent |
 | `resetOnConcurrent` | 2 resets | auto session-reset on concurrent_session |
+
+## Tests
+
+```bash
+npm test          # node --test, no dependencies to install
+```
+
+The suite is self-contained: unit tests drive the translators with fake
+streams, and `test/gateway.test.js` boots the real gateway against a mock
+upstream on a scratch `DATA_DIR`, so no network or credentials are needed.
+
+| file | covers |
+|---|---|
+| `test/stream.test.js` | stop-sequence hold-back, block protocol, malformed tool JSON |
+| `test/lifecycle.test.js` | abort/drain listener hygiene, success-XOR-error terminal state |
+| `test/accounts.test.js` | round-robin cursor purity (`pickOrder` vs `peekOrder`) |
+| `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row |
 
 ## Run with Docker
 
