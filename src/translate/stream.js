@@ -1,6 +1,7 @@
 // translate/stream.js — OpenAI SSE -> Anthropic SSE, with ping keep-alive
 import { randomUUID } from 'node:crypto';
 import { log } from '../logger.js';
+import { mapStopReason } from './stop.js';
 
 const estimateTokens = (blocks) =>
   blocks.reduce((n, b) => n + Math.ceil((b.text ?? b.json ?? '').length / 4), 0);
@@ -402,9 +403,8 @@ function flushPendingToolDeltas(send, blocks) {
   }
 }
 
-function mapStop(fr) {
-  return fr === 'tool_calls' ? 'tool_use' : fr === 'length' ? 'max_tokens' : 'end_turn';
-}
+// shared with translate/response.js so the two paths cannot drift
+const mapStop = (fr) => mapStopReason(fr);
 
 /** Emit a complete OpenAI response as an Anthropic SSE sequence. */
 async function emitWhole(oai, requestModel, res, onUsage, opts = {}) {

@@ -1,11 +1,10 @@
 // translate/response.js — OpenAI Chat Completions response -> Anthropic Messages
 import { randomUUID } from 'node:crypto';
+import { mapStopReason } from './stop.js';
 
-export const stopReason = (finishReason) =>
-  finishReason === 'tool_calls' ? 'tool_use'
-  : finishReason === 'length' ? 'max_tokens'
-  : finishReason === 'stop_sequence' ? 'stop_sequence'
-  : 'end_turn';
+// Re-exported for existing callers; the mapping itself lives in stop.js so the
+// streaming and non-streaming paths cannot disagree.
+export const stopReason = (finishReason) => mapStopReason(finishReason);
 
 /** Upstream returned tool arguments that are not valid JSON — refuse, don't guess. */
 export class MalformedToolCallError extends Error {

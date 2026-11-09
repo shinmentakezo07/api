@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { streamTranslate } from '../src/translate/stream.js';
+import { openAIToAnthropic } from '../src/translate/response.js';
 import { fakeRes, fakeUpstream, sseBody, rawBody, byteChunks, frame, delta } from './helpers.js';
 
 const run = async (chunks, opts = {}, resOpts = {}) => {
@@ -189,4 +190,55 @@ test('usage-only and finish_reason-only chunks are both honoured', async () => {
   assert.equal(res.messageDelta.delta.stop_reason, 'max_tokens');
   assert.equal(res.messageDelta.usage.output_tokens, 5);
   assert.equal(res.messageDelta.usage.input_tokens, 10);
+});
+// ---- stop reason mapping: one table, shared by both paths ---------------
+
+test('stop reasons map consistently on the streaming path', async () => {
+  const cases = {
+    stop: 'end_turn',
+    length: 'max_tokens',
+    tool_calls: 'tool_use',
+    function_call: 'tool_use',
+    content_filter: 'refusal',
+    stop_sequence: 'stop_sequence',
+    unknown_reason: 'end_turn',
+  };
+  for (const [fr, want] of Object.entries(cases)) {
+    const res = await run([{ choices: [{ delta: { content: 'x' }, finish_reason: fr }] }]);
+    assert.equal(res.messageDelta.delta.stop_reason, want, `finish_reason "${fr}"`);
+  }
+});
+
+test('stop_sequence survives the streaming path (mapper parity)', async () => {
+  // the streaming mapper used to omit this, unlike the non-streaming one
+  const res = await run([{ choices: [{ delta: { content: 'x' }, finish_reason: 'stop_sequence' }] }]);
+  assert.equal(res.messageDelta.delta.stop_reason, 'stop_sequence');
+});
+
+// ---- non-streaming path agrees with the streaming path -----------------
+
+test('non-streaming and streaming agree on every finish_reason', async () => {
+  const reasons = ['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'stop_sequence', 'other'];
+  for (const fr of reasons) {
+    const oai = { choices: [{ index: 0, message: { role: 'assistant', content: 'x' }, finish_reason: fr }] };
+    const nonStream = openAIToAnthropic(oai, 'm', {}).stop_reason;
+    const stream = (await run([{ choices: [{ delta: { content: 'x' }, finish_reason: fr }] }])).messageDelta.delta.stop_reason;
+    assert.equal(nonStream, stream, `finish_reason "${fr}" disagrees between paths`);
+  }
+});
+
+test('a filtered response is distinguishable from a clean stop', async () => {
+  const filtered = await run([{ choices: [{ delta: { content: 'x' }, finish_reason: 'content_filter' }] }]);
+  const clean = await run([{ choices: [{ delta: { content: 'x' }, finish_reason: 'stop' }] }]);
+  assert.equal(filtered.messageDelta.delta.stop_reason, 'refusal');
+  assert.notEqual(filtered.messageDelta.delta.stop_reason, clean.messageDelta.delta.stop_reason);
+});
+
+test('a filtered response still terminates cleanly, not as an error', async () => {
+  const res = await run([{ choices: [{ delta: { content: 'x' }, finish_reason: 'content_filter' }] }]);
+  assert.ok(res.events.includes('message_stop'));
+  assert.ok(!res.events.includes('error'));
+  const starts = res.events.filter((e) => e === 'content_block_start').length;
+  const stops = res.events.filter((e) => e === 'content_block_stop').length;
+  assert.equal(starts, stops);
 });

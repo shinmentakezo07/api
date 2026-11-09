@@ -97,6 +97,23 @@ upstream on a scratch `DATA_DIR`, so no network or credentials are needed.
 | `test/accounts.test.js` | round-robin cursor purity (`pickOrder` vs `peekOrder`) |
 | `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row |
 
+## Finish reason mapping
+
+Upstream `finish_reason` is translated to Anthropic `stop_reason` in
+`src/translate/stop.js`, shared by the streaming and non-streaming paths so
+they cannot disagree.
+
+| OpenAI `finish_reason` | Anthropic `stop_reason` |
+|---|---|
+| `stop` / absent / unknown | `end_turn` |
+| `length` | `max_tokens` |
+| `tool_calls` / `function_call` | `tool_use` |
+| `stop_sequence` | `stop_sequence` |
+| `content_filter` | `refusal` |
+
+A filtered response reports `refusal` rather than `end_turn`, so a client can
+tell it apart from a natural stop.
+
 ## Run with Docker
 
 ```bash
