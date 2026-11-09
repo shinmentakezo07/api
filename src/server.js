@@ -12,6 +12,7 @@ import { anthropicToOpenAI } from './translate/request.js';
 import { openAIToAnthropic, errorBody, MalformedToolCallError } from './translate/response.js';
 import { streamTranslate } from './translate/stream.js';
 import { handleAdmin } from './admin.js';
+import { conversationKeyOf } from './session.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -237,11 +238,14 @@ async function handleChatCompletions(req, res, rid, ctx) {
     bodyStr = JSON.stringify(body);
   }
   const signal = clientAbort(res);
+  const conversationKey = conversationKeyOf(body);
 
   return withFailover(async (account) => {
     const started = Date.now();
     const up = await upstream('/v1/chat/completions', {
-      method: 'POST', body: bodyStr, account, signal, onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
+      method: 'POST', body: bodyStr, account, signal, conversationKey,
+      onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
+      onSession: (id) => { if (ctx) ctx.session = id; },
     });
 
     if (!streaming) {
@@ -337,6 +341,7 @@ async function handleMessages(req, res, rid, ctx) {
     return json(res, 400, errorBody(true, 400, 'messages must be a non-empty array'));
   }
   const signal = clientAbort(res);
+  const conversationKey = conversationKeyOf(body);
   await getCatalog(primaryAccount());
   const oai = anthropicToOpenAI(body);
 
@@ -344,7 +349,9 @@ async function handleMessages(req, res, rid, ctx) {
     const started = Date.now();
     const up = await upstream('/v1/chat/completions', {
       method: 'POST', body: JSON.stringify(oai), account, headers: { accept: 'application/json' }, signal,
+      conversationKey,
       onAttempt: (n) => { if (ctx) ctx.attempts = (ctx.attempts ?? 0) + n; },
+      onSession: (id) => { if (ctx) ctx.session = id; },
     });
     if (!up.ok) throw new UpstreamError(up.status, await up.text().catch(() => ''));
 
@@ -379,8 +386,14 @@ async function handleCountTokens(req, res) {
   let body;
   try { body = JSON.parse((await readBody(req)).toString() || '{}'); }
   catch { return json(res, 400, errorBody(true, 400, 'request body is not valid JSON')); }
-  const chars = JSON.stringify(body.messages ?? []).length + JSON.stringify(body.system ?? '').length;
-  return json(res, 200, { input_tokens: Math.ceil(chars / 4) });
+  // Tool schemas are forwarded upstream and eat context too, so count them.
+  // 4 chars/token is optimistic for code-heavy prompts; the divisor is
+  // configurable and defaults to a conservative 3.5.
+  const perToken = Number(config.countTokensCharsPerToken) > 0 ? Number(config.countTokensCharsPerToken) : 4;
+  const chars = JSON.stringify(body.messages ?? []).length
+    + JSON.stringify(body.system ?? '').length
+    + (body.tools ? JSON.stringify(body.tools).length : 0);
+  return json(res, 200, { input_tokens: Math.ceil(chars / perToken) });
 }
 
 async function handleModels(req, res) {
@@ -453,7 +466,7 @@ export function createServer() {
 
     res.on('finish', () => log.info('response', {
       rid, path: url.pathname, status: res.statusCode, ms: Date.now() - started,
-      account: ctx.account, attempts: ctx.attempts, failovers: ctx.failovers,
+      account: ctx.account, session: ctx.session, attempts: ctx.attempts, failovers: ctx.failovers,
       ...(ctx.streamError ? { streamError: ctx.streamError } : {}),
       ...(ctx.tried?.length ? { tried: ctx.tried } : {}),
     }));
@@ -462,6 +475,7 @@ export function createServer() {
       await route.handler(req, res, rid, ctx);
     } catch (err) {
       const status = err instanceof UpstreamError ? err.status
+        : err.name === 'TimeoutError' ? 504
         : Number.isInteger(err.status) ? err.status
         : err.message?.includes('no enabled accounts') ? 503 : 502;
       const detail = err instanceof UpstreamError ? err.body || err.message : err.message;

@@ -73,12 +73,13 @@ function tokensFromEnv(env) {
 export function initAccounts() {
   accounts = [];
 
-  // 1) accounts from .env (read-only in the UI)
+  // 1) accounts from .env AND the process environment (read-only in the UI).
+  // Docker passes FREEPI_TOKEN_* as real env vars via env_file, so reading only
+  // the file silently ignored them and fell back to the CLI's own credentials.
   let envTokens = [];
   try {
-    if (existsSync(config.envFile)) {
-      envTokens = tokensFromEnv(parseEnv(readFileSync(config.envFile, 'utf8')));
-    }
+    const fileEnv = existsSync(config.envFile) ? parseEnv(readFileSync(config.envFile, 'utf8')) : {};
+    envTokens = tokensFromEnv({ ...fileEnv, ...process.env }); // process env wins
   } catch (e) { log.warn('.env parse failed', { error: e.message }); }
   envTokens.forEach((token, i) => {
     accounts.push({ id: `env-${i + 1}`, label: `env-${i + 1}`, token, source: 'env', enabled: true, addedAt: Date.now(), sessionId: sessionIdFor(token) });

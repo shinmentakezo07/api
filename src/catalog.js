@@ -29,7 +29,11 @@ export async function getCatalog(account) {
     if (account) {
       try {
         const { upstream } = await import('./upstream.js');
-        const res = await upstream('/client-version', { account });
+        // bound this: it sits on the critical path of every chat request
+        const res = await upstream('/client-version', {
+          account,
+          signal: AbortSignal.timeout(config.catalogFallbackTimeoutMs ?? 5_000),
+        });
         const data = await res.json();
         cache = { models: Array.isArray(data.models) ? data.models : [], fetchedAt: Date.now() };
         log.debug('catalog refreshed (authenticated fallback)', { count: cache.models.length });

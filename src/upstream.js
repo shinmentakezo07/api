@@ -3,6 +3,7 @@
 // auto /session/reset on concurrent_session.
 import { config, CLIENT_VERSION } from './config.js';
 import { log } from './logger.js';
+import { sessionIdFor, freshSessionId } from './session.js';
 import { readFileSync } from 'node:fs';
 
 /** Error codes free-pi raises (from the CLI's mapErrorCode); used for text fallback. */
@@ -59,10 +60,10 @@ function retryHint(env) {
   return typeof v === 'number' && v > 0 ? v * 1000 : null;
 }
 
-export function fingerprintHeaders(account, extra = {}, path = '') {
+export function fingerprintHeaders(account, extra = {}, path = '', sessionId = account.sessionId) {
   const headers = {
     authorization: `Bearer ${account.token}`,
-    'x-session-id': account.sessionId,
+    'x-session-id': sessionId,
     'x-client-version': CLIENT_VERSION,
     'content-type': 'application/json',
     ...extra,
@@ -128,11 +129,11 @@ function parseBody(rawBody) {
   }
 }
 
-async function once(path, { account, method = 'GET', body, headers = {}, signal } = {}) {
+async function once(path, { account, sessionId, method = 'GET', body, headers = {}, signal } = {}) {
   const url = `${config.base}${path}`;
   return fetch(url, {
     method,
-    headers: fingerprintHeaders(account, headers, path),
+    headers: fingerprintHeaders(account, headers, path, sessionId),
     body: body === undefined || method === 'GET' ? undefined : body,
     signal: signal ?? AbortSignal.timeout(config.requestTimeoutMs),
     redirect: 'manual',
@@ -153,7 +154,13 @@ export async function upstream(path, opts = {}) {
   let reasoningStripped = false;
   let adCycles = 0;
   let timeouts = 0;
+  let rotates = 0;
   const maxTimeoutRetries = config.retry.timeoutRetries ?? 1;
+  const maxRotates = config.concurrentRotateRetries ?? 2;
+  // free-pi runs ONE request at a time per x-session-id (429 'concurrent'), so
+  // every attempt gets its own id instead of one shared per account.
+  let sessionId = opts.sessionId ?? sessionIdFor(account, opts.conversationKey ?? '');
+  opts.onSession?.(sessionId);
 
   // Normalize reasoning controls on chat bodies: client intent -> reasoning_effort.
   if (opts.body && path.includes('/chat/completions')) {
@@ -178,7 +185,7 @@ export async function upstream(path, opts = {}) {
     opts.onAttempt?.(1); // every attempt counts, including retries
     let res;
     try {
-      res = await once(path, { ...opts, signal: mergedSignal(opts.signal) });
+      res = await once(path, { ...opts, sessionId, signal: mergedSignal(opts.signal) });
     } catch (err) {
       if (opts.signal?.aborted) throw err; // client gone — do not retry
       const isTimeout = err.name === 'TimeoutError';
@@ -190,6 +197,10 @@ export async function upstream(path, opts = {}) {
         await sleep(wait, opts.signal);
         continue;
       }
+      // a timeout is a distinct outcome for the client: 504, not a vague 502
+      if (isTimeout) {
+        throw new UpstreamError(504, '', `upstream timed out after ${config.requestTimeoutMs}ms (${path})`, attempt);
+      }
       throw err;
     }
 
@@ -198,7 +209,27 @@ export async function upstream(path, opts = {}) {
     const errText = await res.text().catch(() => '');
     const envelope = parseEnvelope(errText);   // single parse, reused below
 
-    if (errText.includes('concurrent_session') && resets < config.resetOnConcurrent.maxResets) {
+    const concurrentCode = envelope?.code
+      ?? (errText.includes('concurrent_session') ? 'concurrent_session'
+        : errText.includes('concurrent') ? 'concurrent' : undefined);
+
+    // 429 'concurrent' means THIS session id already has a request in flight
+    // ("one request at a time"). Mint a fresh id and retry immediately: no
+    // backoff, no failover, and no /session/reset (which would kill the other
+    // client's stream, since reset closes every other session of the token).
+    if (res.status === 429 && concurrentCode === 'concurrent' && rotates < maxRotates) {
+      rotates++;
+      const previous = sessionId;
+      sessionId = freshSessionId();
+      opts.onSession?.(sessionId);
+      log.warn('upstream session busy, rotating session id', {
+        path, account: account.id, previous, next: sessionId, rotate: rotates,
+      });
+      attempt--;
+      continue;
+    }
+
+    if (concurrentCode === 'concurrent_session' && resets < config.resetOnConcurrent.maxResets) {
       resets++;
       log.warn('concurrent_session limit hit, resetting sessions for account', { path, account: account.id, reset: resets });
       const released = await resetOtherSessions(account.token);

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -12,41 +12,54 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 /** Mock upstream; behaviour selected by the bearer token. */
 function startUpstream() {
   const hits = {};
+  const sessions = [];   // { token, sessionId } in arrival order
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const token = (req.headers.authorization ?? '').replace(/^Bearer /, '');
       hits[token] = (hits[token] ?? 0) + 1;
+      sessions.push({ token, sessionId: req.headers['x-session-id'] });
       // 'tok-bad' always fails with a retryable account issue
       if (token === 'tok-bad') {
         res.writeHead(409, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ code: 'concurrent_session', message: 'session busy' }));
       }
+      // 'tok-hang' never answers, so the gateway's timeout path is exercised
+      if (token === 'tok-hang') return;
+      // 'tok-concurrent' mimics free-pi's one-request-at-a-time-per-session 429
+      if (token === 'tok-concurrent' && hits[token] === 1) {
+        res.writeHead(429, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ code: 'concurrent', message: 'one request at a time' }));
+      }
       const j = JSON.parse(body || '{}');
-      if (!j.stream) {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        return res.end(JSON.stringify({
-          id: 'x', object: 'chat.completion',
-          choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 11, completion_tokens: 7 },
-        }));
-      }
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      for (const piece of ['Hel', 'lo STO', 'P more']) {
-        res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: piece } }] }) + '\n\n');
-      }
-      res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 3 } }) + '\n\n');
-      res.write('data: [DONE]\n\n');
-      res.end();
+      const send = () => {
+        if (!j.stream) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({
+            id: 'x', object: 'chat.completion',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 11, completion_tokens: 7 },
+          }));
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const piece of ['Hel', 'lo STO', 'P more']) {
+          res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: piece } }] }) + '\n\n');
+        }
+        res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 3 } }) + '\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      };
+      // 'tok-slow' keeps the request in flight so concurrency is observable
+      setTimeout(send, token === 'tok-slow' ? 250 : 0);
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, hits, port: server.address().port }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, hits, sessions, port: server.address().port }));
   });
 }
 
-function startGateway({ port, upstreamPort, dataDir, tokens }) {
+function startGateway({ port, upstreamPort, dataDir, tokens, config = {} }) {
   const env = {
     ...process.env,
     PORT: String(port),
@@ -56,7 +69,10 @@ function startGateway({ port, upstreamPort, dataDir, tokens }) {
     FREEPI_ADMIN_KEY: 'test-key',
   };
   tokens.forEach((t, i) => { env['FREEPI_TOKEN_' + (i + 1)] = t; });
-  const child = spawn(process.execPath, ['index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  // Point the gateway at a scratch config: the repo's shi.json names the real
+  // accounts.json, which would otherwise leak real accounts into the tests.
+  writeFileSync(join(dataDir, 'shi.json'), JSON.stringify(config));
+  const child = spawn(process.execPath, ['index.js', '--config', join(dataDir, 'shi.json')], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   child.stdout.on('data', (d) => (output += d));
   child.stderr.on('data', (d) => (output += d));
@@ -102,18 +118,23 @@ test.after(() => {
   rmSync(DATA, { recursive: true, force: true });
 });
 
-const boot = async (tokens) => {
+const boot = async (tokens, config = {}) => {
   upstream = await startUpstream();
   PORT += 1;
-  gw = startGateway({ port: PORT, upstreamPort: upstream.port, dataDir: DATA, tokens });
+  // one data dir per boot: a late usage flush from a previous test must not
+  // land in the next test's usage.json
+  const dataDir = join(DATA, 'run-' + PORT);
+  mkdirSync(join(dataDir, 'logs'), { recursive: true });
+  gw = startGateway({ port: PORT, upstreamPort: upstream.port, dataDir, tokens, config });
   const ready = await waitForPort(PORT);
   assert.ok(ready, 'gateway did not start:\n' + gw.output);
-  return { port: PORT, hits: upstream.hits };
+  return { port: PORT, hits: upstream.hits, dataDir };
 };
 
 const shutdown = async () => {
   gw?.child.kill('SIGTERM');
   await new Promise((r) => setTimeout(r, 300));
+  upstream?.server.closeAllConnections?.(); // hung sockets from 'tok-hang'
   upstream?.server.close();
 };
 
@@ -152,15 +173,55 @@ test('stop_sequences are enforced end-to-end without leaking upstream text', asy
   } finally { await shutdown(); }
 });
 
+test('concurrent clients get distinct upstream session ids', async () => {
+  const { port } = await boot(['tok-slow']);
+  try {
+    const body = { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false };
+    const [a, b] = await Promise.all([
+      post(port, '/v1/chat/completions', body),
+      post(port, '/v1/chat/completions', body),
+    ]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    const ids = upstream.sessions.map((s) => s.sessionId);
+    assert.equal(ids.length, 2);
+    assert.notEqual(ids[0], ids[1], 'two clients must not share one upstream session');
+  } finally { await shutdown(); }
+});
+
+test("a 429 'concurrent' rotates the session id and retries instead of failing over", async () => {
+  const { port, hits } = await boot(['tok-concurrent']);
+  try {
+    const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
+    assert.equal(r.status, 200);
+    assert.equal(JSON.parse(r.body).choices[0].message.content, 'hello');
+    const ids = upstream.sessions.map((s) => s.sessionId);
+    assert.equal(ids.length, 2, 'exactly one retry after the 429');
+    assert.notEqual(ids[0], ids[1], 'the retry must use a fresh session id');
+    assert.equal(hits['tok-concurrent'], 2);
+  } finally { await shutdown(); }
+});
+
+test('an upstream timeout is a 504 with a readable message, not a vague 502', async () => {
+  const { port } = await boot(['tok-hang'], { requestTimeoutMs: 300 });
+  try {
+    const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
+    assert.equal(r.status, 504);
+    assert.match(r.body, /timed out/i);
+  } finally { await shutdown(); }
+});
+
 test('failover serves from the next account and counts the request once', async () => {
-  const { port, hits } = await boot(['tok-bad', 'tok-good']);
+  const { port, hits, dataDir } = await boot(['tok-bad', 'tok-good']);
   try {
     const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
     assert.equal(r.status, 200);
     assert.equal(JSON.parse(r.body).choices[0].message.content, 'hello');
     assert.ok(Object.keys(hits).length >= 1, 'upstream was reached');
-    await new Promise((res) => setTimeout(res, 300));
-    const usageFile = join(DATA, 'logs', 'usage.json');
+    // usage.json is flushed on a 5s timer, so wait for it instead of assuming
+    const usageFile = join(dataDir, 'logs', 'usage.json');
+    const deadline = Date.now() + 8000;
+    while (!existsSync(usageFile) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 100));
     assert.ok(existsSync(usageFile), 'usage persisted');
     const usage = JSON.parse(readFileSync(usageFile, 'utf8'));
     const rows = usage.recent.slice(-1);

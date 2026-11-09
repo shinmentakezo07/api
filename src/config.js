@@ -36,7 +36,19 @@ const DEFAULTS = {
   // context length, so clients cannot discover the limit and only find out by
   // hitting a 400. Set this to match your model; 0 = advertise nothing.
   contextWindow: 200_000,
-  maxOutputTokens: 32_768,     // advertised as max_completion_tokens on /v1/models
+  // The CLI itself caps output at 8192 (MAX_OUTPUT_TOKENS in free-pi-cli) and
+  // the upstream truncates beyond that, so advertising 32k only produces
+  // responses that stop with finish_reason "length" for no reason.
+  maxOutputTokens: 8_192,      // advertised as max_completion_tokens on /v1/models
+  // Upstream session identity. free-pi allows ONE in-flight request per
+  // x-session-id; sharing one id per account serialises every client.
+  //   'request'      fresh id per request (default) — never collides
+  //   'conversation' stable per conversation (system + first turn)
+  //   'account'      one stable id per account (legacy, serialising)
+  sessionStrategy: 'request',
+  concurrentRotateRetries: 2,  // 429 'concurrent' -> new session id, retry at once
+  countTokensCharsPerToken: 3.5, // /v1/messages/count_tokens estimate; <4 = conservative
+  catalogFallbackTimeoutMs: 5_000, // bound the authenticated catalog fetch
 };
 
 // --- CLI args -----------------------------------------------------------
@@ -88,8 +100,10 @@ if (process.env.ADMIN_KEY) envCfg.adminKey = process.env.ADMIN_KEY;
 if (process.env.FREEPI_ADMIN_KEY) envCfg.adminKey = process.env.FREEPI_ADMIN_KEY;
 if (process.env.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(process.env.FREEPI_CONTEXT_WINDOW);
 if (process.env.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(process.env.FREEPI_MAX_OUTPUT_TOKENS);
+if (process.env.FREEPI_SESSION_STRATEGY) envCfg.sessionStrategy = process.env.FREEPI_SESSION_STRATEGY;
 if (envFile.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(envFile.FREEPI_CONTEXT_WINDOW);
 if (envFile.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(envFile.FREEPI_MAX_OUTPUT_TOKENS);
+if (envFile.FREEPI_SESSION_STRATEGY) envCfg.sessionStrategy = envFile.FREEPI_SESSION_STRATEGY;
 if (envFile.ADMIN_KEY) envCfg.adminKey = envFile.ADMIN_KEY;
 if (envFile.FREEPI_ADMIN_KEY) envCfg.adminKey = envFile.FREEPI_ADMIN_KEY;
 

@@ -35,9 +35,11 @@ API key:  anything (or a key from clientKeys in shi.json)
 
 Each account is one free-pi JWT. Sources, in priority order:
 
-1. **`.env`** (read-only in the UI):
+1. **`.env` or the process environment** (read-only in the UI):
    - `FREEPI_ACCOUNTS=token1,token2` or `FREEPI_ACCOUNTS=["tok1","tok2"]`
    - or `FREEPI_TOKEN_1=...`, `FREEPI_TOKEN_2=...` (up to 20)
+   - both are read: the real environment wins over the file, so
+     `docker run -e FREEPI_TOKEN_1=...` works without a `.env`
 2. **Admin UI** — two ways:
    - **Sign in with GitHub** — runs the same device flow as free-pi-cli
      (`/auth/github/device` → consent → poll `/auth/token`); open the link,
@@ -51,8 +53,27 @@ hits `concurrent_session` (4-session limit), the gateway calls
 `POST /session/reset` (same as the CLI's `/close-other-session`) and retries;
 if it still fails, the request **fails over to the next account**.
 
-Each account gets a stable `x-session-id` (hash of its token) so restarts
-reuse the same backend session slots.
+### Upstream sessions (why requests used to queue)
+
+free-pi runs **one request at a time per `x-session-id`** and answers the rest
+with `429 {"code":"concurrent"}`. It is stateless otherwise: the conversation
+lives in the `messages` the client replays, not in the session.
+
+Giving every request of an account the same id therefore serialised all clients
+behind each other, and under load the gateway spent its attempts on 429s,
+backed off 1.5 s and failed over — which looks like "the proxy is reusing an
+old session". Each request now gets its own id (`sessionStrategy`), and a 429
+`concurrent` mints a fresh id and retries immediately.
+
+| strategy | session id | when to use |
+|---|---|---|
+| `request` (default) | fresh per request | many clients per account; nothing is ever shared |
+| `conversation` | stable per conversation (system + first turn) | one upstream slot per chat |
+| `account` | stable per account (hash of the token) | legacy behaviour; serialises clients |
+
+`concurrent_session` (409, the token's session-slot limit) still triggers
+`POST /session/reset`; a plain `concurrent` (429) does **not**, because a reset
+closes the token's other sessions and would kill another client's stream.
 
 ## Admin UI
 
@@ -78,6 +99,10 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 | `logRotate` | 10 MiB × 5 | size-based rotation of `gateway.log` (`gateway.log` → `gateway.1.log` …) |
 | `maxInFlightPerAccount` | 4 | free-pi session limit; logs `account at session limit` when reached |
 | `maxBufferedBytes` | 32 MiB | cap on a non-streaming response held in memory before it is sent |
+| `sessionStrategy` | `request` | `request` \| `conversation` \| `account` — see above |
+| `concurrentRotateRetries` | 2 | 429 `concurrent` → new session id and an immediate retry |
+| `countTokensCharsPerToken` | 3.5 | divisor for `/v1/messages/count_tokens` (lower = more conservative) |
+| `catalogFallbackTimeoutMs` | 5000 | bound on the authenticated catalog fetch |
 | `resetOnConcurrent` | 2 resets | auto session-reset on concurrent_session |
 
 ## Tests
@@ -95,7 +120,8 @@ upstream on a scratch `DATA_DIR`, so no network or credentials are needed.
 | `test/stream.test.js` | stop-sequence hold-back, block protocol, malformed tool JSON |
 | `test/lifecycle.test.js` | abort/drain listener hygiene, success-XOR-error terminal state |
 | `test/accounts.test.js` | round-robin cursor purity (`pickOrder` vs `peekOrder`) |
-| `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row |
+| `test/session.test.js` | session-id strategies and conversation keying |
+| `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row, distinct session ids under concurrency, 429 `concurrent` rotation, 504 on timeout |
 
 ## Context window and upstream errors
 
@@ -106,7 +132,10 @@ discover the limit by having a request rejected. Two knobs are advertised on
 | env var | default | advertised as |
 |---|---|---|
 | `FREEPI_CONTEXT_WINDOW` | `200000` | `context_length` / `context_window` |
-| `FREEPI_MAX_OUTPUT_TOKENS` | `32768` | `max_completion_tokens` |
+| `FREEPI_MAX_OUTPUT_TOKENS` | `8192` | `max_completion_tokens` |
+
+`FREEPI_MAX_OUTPUT_TOKENS` defaults to the CLI's own cap (8192); advertising
+more only makes responses stop with `finish_reason: "length"` for no reason.
 
 Set `FREEPI_CONTEXT_WINDOW=0` to advertise nothing. Match these to the model you
 actually route to — an advertised limit that is higher than the upstream's own
@@ -173,7 +202,8 @@ src/config.js       layered config: defaults <- shi.json <- env <- args
 src/logger.js       leveled console + JSONL file log
 src/accounts.js     multi-account store, round-robin, persistence
 src/usage.js        per-account counters + recent requests, persisted
-src/upstream.js     fingerprint client: retry, 401 reload, session reset
+src/session.js      upstream session identity (request / conversation / account)
+src/upstream.js     fingerprint client: retry, 401 reload, session rotation/reset
 src/catalog.js      model catalog cache
 src/credentials.js  JWT load/refresh for the cli fallback account
 src/admin.js        admin API + single-page UI
