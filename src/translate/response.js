@@ -1,6 +1,7 @@
 // translate/response.js — OpenAI Chat Completions response -> Anthropic Messages
 import { randomUUID } from 'node:crypto';
 import { mapStopReason } from './stop.js';
+import { readUpstreamError } from './errors.js';
 
 // Re-exported for existing callers; the mapping itself lives in stop.js so the
 // streaming and non-streaming paths cannot disagree.
@@ -78,9 +79,15 @@ export function openAIToAnthropic(oai, requestModel, opts = {}) {
 
 /** Map an upstream error into the right error shape for the client. */
 export function errorBody(isAnthropicRoute, status, detail) {
+  // detail is often the upstream's raw JSON body; unwrap it so the client sees
+  // a readable message rather than a JSON document nested inside a string.
+  const { message, type: upstreamType, code } = readUpstreamError(detail);
+  const text = (message || String(detail ?? '')).slice(0, 500);
   if (isAnthropicRoute) {
     const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' : status === 400 ? 'invalid_request_error' : 'api_error';
-    return { type: 'error', error: { type, message: String(detail).slice(0, 500) } };
+    // Anthropic has no context-window error type; keep it invalid_request_error
+    // (what the SDK expects) and carry the upstream code so callers can detect it.
+    return { type: 'error', error: { type, message: text, ...(code ? { code } : {}) } };
   }
-  return { error: { message: String(detail).slice(0, 500), type: 'upstream_error', code: status } };
+  return { error: { message: text, type: upstreamType ?? 'upstream_error', code: status } };
 }

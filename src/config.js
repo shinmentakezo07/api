@@ -32,6 +32,11 @@ const DEFAULTS = {
   resetOnConcurrent: { maxResets: 2, settleMs: 500 }, // auto /close-other-session on concurrent_session
   credRefreshMs: 60_000,       // re-read credentials.json at most this often
   requestTimeoutMs: 300_000,   // hard cap per upstream call
+  // Context window advertised on /v1/models. The upstream catalog publishes no
+  // context length, so clients cannot discover the limit and only find out by
+  // hitting a 400. Set this to match your model; 0 = advertise nothing.
+  contextWindow: 200_000,
+  maxOutputTokens: 32_768,     // advertised as max_completion_tokens on /v1/models
 };
 
 // --- CLI args -----------------------------------------------------------
@@ -81,6 +86,10 @@ if (process.env.FREEPI_CREDENTIALS_FILE) envCfg.credentialsFile = process.env.FR
 // admin key from .env or process env (ADMIN_KEY or FREEPI_ADMIN_KEY)
 if (process.env.ADMIN_KEY) envCfg.adminKey = process.env.ADMIN_KEY;
 if (process.env.FREEPI_ADMIN_KEY) envCfg.adminKey = process.env.FREEPI_ADMIN_KEY;
+if (process.env.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(process.env.FREEPI_CONTEXT_WINDOW);
+if (process.env.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(process.env.FREEPI_MAX_OUTPUT_TOKENS);
+if (envFile.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(envFile.FREEPI_CONTEXT_WINDOW);
+if (envFile.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(envFile.FREEPI_MAX_OUTPUT_TOKENS);
 if (envFile.ADMIN_KEY) envCfg.adminKey = envFile.ADMIN_KEY;
 if (envFile.FREEPI_ADMIN_KEY) envCfg.adminKey = envFile.FREEPI_ADMIN_KEY;
 

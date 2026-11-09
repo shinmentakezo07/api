@@ -97,6 +97,26 @@ upstream on a scratch `DATA_DIR`, so no network or credentials are needed.
 | `test/accounts.test.js` | round-robin cursor purity (`pickOrder` vs `peekOrder`) |
 | `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row |
 
+## Context window and upstream errors
+
+The upstream catalog publishes **no** context length, so a client could only
+discover the limit by having a request rejected. Two knobs are advertised on
+`GET /v1/models` (OpenAI-compatible field names):
+
+| env var | default | advertised as |
+|---|---|---|
+| `FREEPI_CONTEXT_WINDOW` | `200000` | `context_length` / `context_window` |
+| `FREEPI_MAX_OUTPUT_TOKENS` | `32768` | `max_completion_tokens` |
+
+Set `FREEPI_CONTEXT_WINDOW=0` to advertise nothing. Match these to the model you
+actually route to — an advertised limit that is higher than the upstream's own
+just moves the failure later.
+
+Upstream errors are unwrapped rather than passed through as raw JSON, so
+clients see a readable `message` plus the provider `code`
+(e.g. `context_length_exceeded`). An error arriving **inside** a 200 SSE stream
+is surfaced as an `error` event rather than a well-formed empty message.
+
 ## Finish reason mapping
 
 Upstream `finish_reason` is translated to Anthropic `stop_reason` in

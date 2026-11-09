@@ -385,8 +385,15 @@ async function handleCountTokens(req, res) {
 
 async function handleModels(req, res) {
   const models = await getCatalog(primaryAccount());
+  // The upstream catalog carries no context length, so clients could only learn
+  // the limit by failing a request. Advertise it here (OpenAI-compatible
+  // fields: context_length / max_completion_tokens) when configured.
+  const ctx = Number(config.contextWindow) > 0 ? Number(config.contextWindow) : null;
+  const maxOut = Number(config.maxOutputTokens) > 0 ? Number(config.maxOutputTokens) : null;
   const list = (models.length ? models : [{ id: defaultModel(), stats_id: defaultModel() }]).map((m) => ({
     id: m.stats_id ?? m.id, object: 'model', created: 0, owned_by: 'free-pi',
+    ...(ctx ? { context_length: ctx, context_window: ctx } : {}),
+    ...(maxOut ? { max_completion_tokens: maxOut } : {}),
   }));
   return json(res, 200, { object: 'list', data: list });
 }

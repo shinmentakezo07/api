@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { streamTranslate } from '../src/translate/stream.js';
-import { openAIToAnthropic } from '../src/translate/response.js';
+import { openAIToAnthropic, errorBody } from '../src/translate/response.js';
+import { isContextLengthError } from '../src/translate/errors.js';
 import { fakeRes, fakeUpstream, sseBody, rawBody, byteChunks, frame, delta } from './helpers.js';
 
 const run = async (chunks, opts = {}, resOpts = {}) => {
@@ -241,4 +242,50 @@ test('a filtered response still terminates cleanly, not as an error', async () =
   const starts = res.events.filter((e) => e === 'content_block_start').length;
   const stops = res.events.filter((e) => e === 'content_block_stop').length;
   assert.equal(starts, stops);
+});
+// ---- context-window / upstream error surfacing --------------------------
+
+test('an upstream error chunk never becomes a fake empty success', async () => {
+  // a rejected token count arrives inside a 200 SSE stream; before the fix the
+  // client got stop_reason end_turn with no content, indistinguishable from a
+  // legitimate empty answer
+  const res = await runRaw(
+    'data: ' + JSON.stringify({ error: { message: "This model's maximum context length is 65536 tokens.", type: 'invalid_request_error', code: 'context_length_exceeded' } }) + '\n\n',
+  );
+  assert.ok(res.events.includes('error'), 'must surface an error event');
+  assert.ok(!res.events.includes('message_stop'), 'must not emit message_stop after an error');
+  assert.match(res.out, /maximum context length/);
+});
+
+test('the error message is readable text, not nested JSON', async () => {
+  const res = await runRaw(
+    'data: ' + JSON.stringify({ error: { message: 'boom', type: 'invalid_request_error' } }) + '\n\n',
+  );
+  assert.ok(!/\\"message\\"/.test(res.out), 'message must not contain escaped JSON');
+});
+
+test('errorBody unwraps an upstream JSON body into a readable message', () => {
+  const body = JSON.stringify({ error: { message: 'context too long', type: 'invalid_request_error', code: 'context_length_exceeded' } });
+  const anthropic = errorBody(true, 400, body);
+  assert.equal(anthropic.error.message, 'context too long');
+  assert.equal(anthropic.error.type, 'invalid_request_error');
+  assert.equal(anthropic.error.code, 'context_length_exceeded');
+
+  const openai = errorBody(false, 400, body);
+  assert.equal(openai.error.message, 'context too long');
+});
+
+test('errorBody keeps a non-JSON body as plain text', () => {
+  const b = errorBody(true, 502, 'plain failure text');
+  assert.equal(b.error.message, 'plain failure text');
+});
+
+test('context-length errors are detected across provider wordings', () => {
+  const cases = [
+    JSON.stringify({ error: { message: "This model's maximum context length is 65536 tokens." } }),
+    JSON.stringify({ error: { message: 'prompt is too long', code: 'context_length_exceeded' } }),
+    JSON.stringify({ error: { message: 'Please reduce the length of the messages.' } }),
+  ];
+  for (const c of cases) assert.equal(isContextLengthError(c), true, c);
+  assert.equal(isContextLengthError(JSON.stringify({ error: { message: 'rate limited' } })), false);
 });

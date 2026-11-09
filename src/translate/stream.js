@@ -11,6 +11,18 @@ class StopSequenceHit extends Error {
   constructor() { super('stop sequence matched'); }
 }
 
+/** The upstream reported a failure inside an otherwise-200 SSE stream. */
+class UpstreamStreamError extends Error {}
+
+/** Readable text from an upstream error object, never a nested JSON blob. */
+function friendlyMessage(err) {
+  const e = err?.error ?? err ?? {};
+  if (typeof e === 'string') return e;
+  return (typeof e.message === 'string' && e.message)
+    || (typeof e.error === 'string' && e.error)
+    || 'upstream stream error';
+}
+
 /**
  * Consume an OpenAI chat-completions SSE stream and re-emit it as an
  * Anthropic Messages SSE stream on `res`.
@@ -107,6 +119,14 @@ export async function streamTranslate(upstreamRes, requestModel, res, onUsage, o
     if (payload === '[DONE]') return;
     let chunk;
     try { chunk = JSON.parse(payload); } catch { return; }
+
+    // An upstream can report a failure inside the SSE stream while the HTTP
+    // status is still 200 (a rejected token count is the common case). Treat
+    // it as a stream error so the client gets an error event instead of a
+    // well-formed empty message that looks like a successful answer.
+    if (chunk.error && !chunk.choices) {
+      throw new UpstreamStreamError(friendlyMessage(chunk.error));
+    }
 
     if (chunk.usage) {
       inTokens = chunk.usage.prompt_tokens ?? inTokens;
