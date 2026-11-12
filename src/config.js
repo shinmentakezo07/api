@@ -12,7 +12,13 @@ const DEFAULTS = {
   port: 8787,
   host: '127.0.0.1',
   base: 'https://api.freepi.ai',
-  cliVersion: '0.6.14',
+  // x-client-version. 'auto' asks GET /client-version (the CLI's own update
+  // check) for min/latest and sends `latest` (min is only a floor); a 426
+  // upgrade_required bumps it and retries. A concrete version pins a floor —
+  // upstream can still raise it.
+  cliVersion: 'auto',
+  versionCheckMs: 10 * 60 * 1000,     // re-read /client-version every 10 min
+  versionFetchTimeoutMs: 3_000,       // bound the startup / refresh fetch
   defaultModel: 'deepseek/deepseek-v4-flash',
   credentialsFile: join(homedir(), '.free-pi', 'agent', 'credentials.json'),
   logFile: join(ROOT, 'logs', 'gateway.log'),
@@ -101,9 +107,11 @@ if (process.env.FREEPI_ADMIN_KEY) envCfg.adminKey = process.env.FREEPI_ADMIN_KEY
 if (process.env.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(process.env.FREEPI_CONTEXT_WINDOW);
 if (process.env.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(process.env.FREEPI_MAX_OUTPUT_TOKENS);
 if (process.env.FREEPI_SESSION_STRATEGY) envCfg.sessionStrategy = process.env.FREEPI_SESSION_STRATEGY;
+if (process.env.FREEPI_CLIENT_VERSION) envCfg.cliVersion = process.env.FREEPI_CLIENT_VERSION;
 if (envFile.FREEPI_CONTEXT_WINDOW) envCfg.contextWindow = Number(envFile.FREEPI_CONTEXT_WINDOW);
 if (envFile.FREEPI_MAX_OUTPUT_TOKENS) envCfg.maxOutputTokens = Number(envFile.FREEPI_MAX_OUTPUT_TOKENS);
 if (envFile.FREEPI_SESSION_STRATEGY) envCfg.sessionStrategy = envFile.FREEPI_SESSION_STRATEGY;
+if (envFile.FREEPI_CLIENT_VERSION) envCfg.cliVersion = envFile.FREEPI_CLIENT_VERSION;
 if (envFile.ADMIN_KEY) envCfg.adminKey = envFile.ADMIN_KEY;
 if (envFile.FREEPI_ADMIN_KEY) envCfg.adminKey = envFile.FREEPI_ADMIN_KEY;
 
@@ -128,4 +136,3 @@ export const config = merged;
 export const configFileUsed = configFile;
 export const hasConfigFile = existsSync(configFile);
 export const SESSION_ID = fileCfg.sessionId ?? randomUUID();
-export const CLIENT_VERSION = merged.cliVersion;

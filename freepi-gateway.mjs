@@ -8,7 +8,7 @@
 //
 // All requests are sent upstream with the same fingerprint as free-pi-cli:
 //   Authorization: Bearer <jwt from ~/.free-pi/agent/credentials.json>
-//   x-session-id: <uuid>   x-client-version: 0.6.14
+//   x-session-id: <uuid>   x-client-version: <from GET /client-version>
 //
 // Run:  node freepi-gateway.mjs [--port 8787]
 // Claude Code:
@@ -36,7 +36,45 @@ if (existsSync(configFile)) {
 
 const PORT = Number(argOf('--port') ?? cfg.port ?? process.env.PORT ?? 8787);
 const BASE = (argOf('--base') ?? cfg.base ?? process.env.FREEPI_BASE_URL ?? 'https://api.freepi.ai').replace(/\/+$/, '');
-const CLI_VERSION = cfg.cliVersion ?? '0.6.14';
+// Client version: upstream refuses a stale value before looking at the request
+//   426 {"code":"upgrade_required","message":"... below the required minimum (0.6.19) ..."}
+// so read it from GET /client-version (the CLI's own update check) instead of
+// hard-coding it, and adopt a newer minimum whenever a 426 names one.
+const PINNED_VERSION = /^\d+\.\d+\.\d+$/.test(String(cfg.cliVersion ?? '')) ? String(cfg.cliVersion) : null;
+let clientVersion = PINNED_VERSION ?? '0.6.19';
+const VERSION_CHECK_MS = Number(cfg.versionCheckMs) > 0 ? Number(cfg.versionCheckMs) : 10 * 60 * 1000;
+
+const cmp = (a, b) => {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) < (pb[i] ?? 0) ? -1 : 1;
+  return 0;
+};
+
+async function refreshClientVersion() {
+  try {
+    const res = await fetch(`${BASE}/client-version`, {
+      headers: { 'x-client-version': clientVersion, 'x-freepi-cost-exp': '1', accept: 'application/json' },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return;
+    const d = await res.json();
+    // use `latest` (what the CLI would install); `min` is only a floor
+    for (const v of [d.latest, d.min]) if (v && cmp(v, clientVersion) > 0) clientVersion = v;
+  } catch {}
+}
+
+/** fetch, but adopt the minimum from a 426 upgrade_required and retry once. */
+async function upstreamFetch(url, init) {
+  const res = await fetch(url, init);
+  if (res.status !== 426) return res;
+  const text = await res.clone().text();
+  const m = text.match(/minimum \((\d+\.\d+\.\d+)\)/i);
+  if (!m || cmp(m[1], clientVersion) <= 0) return res;
+  console.log(`upstream requires client ${m[1]} (had ${clientVersion}), retrying`);
+  clientVersion = m[1];
+  return fetch(url, { ...init, headers: { ...init.headers, 'x-client-version': clientVersion } });
+}
 const DEFAULT_MODEL = cfg.defaultModel ?? 'deepseek/deepseek-v4-flash';
 const CRED_FILE = cfg.credentialsFile ?? join(homedir(), '.free-pi', 'agent', 'credentials.json');
 const SESSION_ID = randomUUID();
@@ -55,7 +93,7 @@ function fingerprintHeaders(extra = {}) {
   return {
     authorization: `Bearer ${getToken()}`,
     'x-session-id': SESSION_ID,
-    'x-client-version': CLI_VERSION,
+    'x-client-version': clientVersion,
     'content-type': 'application/json',
     ...extra,
   };
@@ -228,7 +266,7 @@ const server = http.createServer(async (req, res) => {
     // --- OpenAI passthrough ---
     if (path === '/v1/chat/completions') {
       const body = await readBody(req);
-      const up = await fetch(`${BASE}/v1/chat/completions`, {
+      const up = await upstreamFetch(`${BASE}/v1/chat/completions`, {
         method: 'POST', headers: fingerprintHeaders({ accept: req.headers.accept ?? 'application/json' }),
         body: body.length ? body : undefined,
       });
@@ -248,7 +286,7 @@ const server = http.createServer(async (req, res) => {
       const oai = anthropicToOpenAI(body);
       await getCatalog(); // ensure model resolution has data
       oai.model = resolveModel(body.model);
-      const up = await fetch(`${BASE}/v1/chat/completions`, { method: 'POST', headers: fingerprintHeaders(), body: JSON.stringify(oai) });
+      const up = await upstreamFetch(`${BASE}/v1/chat/completions`, { method: 'POST', headers: fingerprintHeaders(), body: JSON.stringify(oai) });
       if (!up.ok) {
         const errText = await up.text();
         res.writeHead(up.status, { 'content-type': 'application/json' });
@@ -299,6 +337,10 @@ async function streamPassthrough(up, res) {
   while (true) { const { done, value } = await r.read(); if (done) break; if (!res.write(value)) await new Promise(x => res.once('drain', x)); }
   res.end();
 }
+
+// always re-read on start (never a cached value), then keep it fresh
+await refreshClientVersion();
+setInterval(refreshClientVersion, VERSION_CHECK_MS).unref();
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`free-pi gateway`);

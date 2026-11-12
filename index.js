@@ -8,6 +8,7 @@ import { log } from './src/logger.js';
 import { initAccounts, accountCount } from './src/accounts.js';
 import { initUsage, stopUsage } from './src/usage.js';
 import { createServer } from './src/server.js';
+import { initVersion, refreshVersion, versionInfo } from './src/version.js';
 
 // admin key: .env/process env or shi.json override, else generated once and persisted
 let adminKey = config.adminKey;
@@ -24,9 +25,19 @@ if (!adminKey) {
 }
 config.adminKey = adminKey;
 
+// Client version: upstream refuses a stale x-client-version with 426
+// upgrade_required, so ask /client-version (the CLI's own update check) for the
+// current min/latest instead of hard-coding one. Refreshed on a timer after this.
+initVersion();
+// A restart always re-reads it (never a cached value); retry a flaky fetch so
+// the first request is not the one that discovers a stale version.
+await refreshVersion({ attempts: 3 });
+const clientInfo = versionInfo();
+
 console.log('free-pi gateway');
 console.log(`  config   : ${configFileUsed}${hasConfigFile ? '' : ' (not found — defaults in use)'}`);
 console.log(`  upstream : ${config.base}`);
+console.log(`  client   : ${clientInfo.version} (${clientInfo.source}${clientInfo.min ? `; upstream min ${clientInfo.min}, latest ${clientInfo.latest}` : ''}${clientInfo.error ? `; fetch failed: ${clientInfo.error}` : ''})`);
 console.log(`  model    : ${config.defaultModel}`);
 console.log(`  admin ui : http://${config.host}:${config.port}/admin`);
 console.log(`  admin key: ${adminKey} (${keySource})`);
@@ -49,6 +60,10 @@ try {
 } catch (e) {
   log.warn(e.message, { note: 'gateway still starts; requests need at least one account' });
 }
+
+// re-read the version detail periodically; a 426 still bumps it immediately
+const versionTimer = setInterval(() => { refreshVersion().catch(() => {}); }, Math.max(60_000, config.versionCheckMs ?? 6 * 60 * 60 * 1000));
+versionTimer.unref();
 
 const gw = createServer();
 await gw.listen();

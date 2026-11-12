@@ -13,6 +13,7 @@ import { openAIToAnthropic, errorBody, MalformedToolCallError } from './translat
 import { streamTranslate } from './translate/stream.js';
 import { handleAdmin } from './admin.js';
 import { conversationKeyOf } from './session.js';
+import { versionInfo } from './version.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -414,6 +415,7 @@ async function handleModels(req, res) {
 async function handleHealth(req, res) {
   return json(res, 200, {
     ok: true, upstream: config.base, session: SESSION_ID, inFlight: inFlightAll(),
+    clientVersion: versionInfo(),
     endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/messages/count_tokens', '/v1/models', '/admin', '/health'],
   });
 }

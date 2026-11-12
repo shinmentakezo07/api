@@ -1,6 +1,7 @@
 // catalog.js — model catalog from GET /client-version, cached; uses any account
-import { config, CLIENT_VERSION } from './config.js';
+import { config } from './config.js';
 import { log } from './logger.js';
+import { clientVersion, applyVersionInfo } from './version.js';
 
 let cache = { models: [], fetchedAt: 0 };
 
@@ -11,7 +12,7 @@ let cache = { models: [], fetchedAt: 0 };
  */
 async function fetchCatalog() {
   const res = await fetch(`${config.base}/client-version`, {
-    headers: { 'x-client-version': CLIENT_VERSION, accept: 'application/json' },
+    headers: { 'x-client-version': clientVersion(), accept: 'application/json' },
     signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) throw new Error(`client-version ${res.status}`);
@@ -22,6 +23,9 @@ export async function getCatalog(account) {
   if (Date.now() - cache.fetchedAt < config.catalogTtlMs) return cache.models;
   try {
     const data = await fetchCatalog();
+    // the same payload carries the version detail (min/latest) — one call keeps
+    // both the catalog and x-client-version current
+    applyVersionInfo(data, 'catalog');
     cache = { models: Array.isArray(data.models) ? data.models : [], fetchedAt: Date.now() };
     log.debug('catalog refreshed', { count: cache.models.length });
   } catch (e) {
@@ -35,6 +39,7 @@ export async function getCatalog(account) {
           signal: AbortSignal.timeout(config.catalogFallbackTimeoutMs ?? 5_000),
         });
         const data = await res.json();
+        applyVersionInfo(data, 'catalog');
         cache = { models: Array.isArray(data.models) ? data.models : [], fetchedAt: Date.now() };
         log.debug('catalog refreshed (authenticated fallback)', { count: cache.models.length });
         return cache.models;

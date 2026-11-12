@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -9,17 +10,32 @@ import { dirname, join } from 'node:path';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+/** Semver compare, so the mock can refuse a stale x-client-version like upstream. */
+const cmp = (a, b) => {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) < (pb[i] ?? 0) ? -1 : 1;
+  return 0;
+};
+
 /** Mock upstream; behaviour selected by the bearer token. */
-function startUpstream() {
+function startUpstream({ latest = '0.6.19' } = {}) {
   const hits = {};
   const sessions = [];   // { token, sessionId } in arrival order
+  const versions = [];   // { token, version } — x-client-version per attempt
   const server = http.createServer((req, res) => {
+    // the gateway resolves x-client-version from here at startup and on a timer
+    if (req.url === '/client-version') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ min: '0.6.19', latest, models: [] }));
+    }
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const token = (req.headers.authorization ?? '').replace(/^Bearer /, '');
       hits[token] = (hits[token] ?? 0) + 1;
       sessions.push({ token, sessionId: req.headers['x-session-id'] });
+      versions.push({ token, version: req.headers['x-client-version'] });
       // 'tok-bad' always fails with a retryable account issue
       if (token === 'tok-bad') {
         res.writeHead(409, { 'content-type': 'application/json' });
@@ -27,6 +43,12 @@ function startUpstream() {
       }
       // 'tok-hang' never answers, so the gateway's timeout path is exercised
       if (token === 'tok-hang') return;
+      // 'tok-old' refuses a stale x-client-version exactly like the real 426
+      if (token === 'tok-old' && cmp(req.headers['x-client-version'], '9.9.9') < 0) {
+        const message = 'your free-pi-cli is below the required minimum (9.9.9); update with: npx free-pi-cli@latest';
+        res.writeHead(426, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ code: 'upgrade_required', message, error: { message, code: 'upgrade_required', type: 'free_pi_error' } }));
+      }
       // 'tok-concurrent' mimics free-pi's one-request-at-a-time-per-session 429
       if (token === 'tok-concurrent' && hits[token] === 1) {
         res.writeHead(429, { 'content-type': 'application/json' });
@@ -55,7 +77,7 @@ function startUpstream() {
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, hits, sessions, port: server.address().port }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, hits, sessions, versions, port: server.address().port }));
   });
 }
 
@@ -103,6 +125,15 @@ const post = (port, path, body) => new Promise((resolve, reject) => {
   req.end(data);
 });
 
+const getJson = (port, path) => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, path }, (res) => {
+    let out = '';
+    res.on('data', (c) => (out += c));
+    res.on('end', () => resolve(JSON.parse(out)));
+  });
+  req.on('error', reject);
+});
+
 /** One gateway for the whole file, restarted per test group via before/after. */
 const DATA = '/tmp/gw-test-' + process.pid;
 let gw, upstream, PORT = 8820 + Math.floor(Math.random() * 200);
@@ -118,9 +149,19 @@ test.after(() => {
   rmSync(DATA, { recursive: true, force: true });
 });
 
-const boot = async (tokens, config = {}) => {
-  upstream = await startUpstream();
+/** True when nothing is listening on the port (a stale gateway from an older
+ *  run would answer /health and make the new one fail with EADDRINUSE). */
+const portFree = (port) => new Promise((resolve) => {
+  const s = net.createServer();
+  s.once('error', () => resolve(false));
+  s.once('listening', () => s.close(() => resolve(true)));
+  s.listen(port, '127.0.0.1');
+});
+
+const boot = async (tokens, config = {}, upstreamOpts = {}) => {
+  upstream = await startUpstream(upstreamOpts);
   PORT += 1;
+  while (!(await portFree(PORT))) PORT += 1;
   // one data dir per boot: a late usage flush from a previous test must not
   // land in the next test's usage.json
   const dataDir = join(DATA, 'run-' + PORT);
@@ -128,7 +169,7 @@ const boot = async (tokens, config = {}) => {
   gw = startGateway({ port: PORT, upstreamPort: upstream.port, dataDir, tokens, config });
   const ready = await waitForPort(PORT);
   assert.ok(ready, 'gateway did not start:\n' + gw.output);
-  return { port: PORT, hits: upstream.hits, dataDir };
+  return { port: PORT, hits: upstream.hits, versions: upstream.versions, dataDir };
 };
 
 const shutdown = async () => {
@@ -202,11 +243,47 @@ test("a 429 'concurrent' rotates the session id and retries instead of failing o
   } finally { await shutdown(); }
 });
 
+test('a 426 upgrade_required bumps x-client-version and retries transparently', async () => {
+  const { port, versions } = await boot(['tok-old']);
+  try {
+    const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
+    assert.equal(r.status, 200, 'the client never sees the 426');
+    assert.equal(JSON.parse(r.body).choices[0].message.content, 'hello');
+    const seen = versions.filter((v) => v.token === 'tok-old').map((v) => v.version);
+    assert.equal(seen.length, 2, 'exactly one retry after the 426');
+    assert.ok(cmp(seen[0], '9.9.9') < 0, 'the first attempt used a stale version');
+    assert.equal(seen[1], '9.9.9', 'the retry reported the minimum upstream named');
+    const health = await getJson(port, '/health');
+    assert.equal(health.clientVersion.version, '9.9.9');
+  } finally { await shutdown(); }
+});
+
+test('a restart re-reads /client-version and uses the new latest', async () => {
+  const body = { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false };
+
+  const first = await boot(['tok-a'], {}, { latest: '0.6.20' });
+  try {
+    const r = await post(first.port, '/v1/chat/completions', body);
+    assert.equal(r.status, 200, r.body);
+    const seen = first.versions.filter((v) => v.token === 'tok-a').map((v) => v.version);
+    assert.equal(seen.at(-1), '0.6.20', 'the first start used the latest it fetched');
+  } finally { await shutdown(); }
+
+  // upstream publishes a newer release while the gateway is down
+  const second = await boot(['tok-a'], {}, { latest: '0.6.21' });
+  try {
+    const r = await post(second.port, '/v1/chat/completions', body);
+    assert.equal(r.status, 200, r.body);
+    const seen = second.versions.filter((v) => v.token === 'tok-a').map((v) => v.version);
+    assert.equal(seen.at(-1), '0.6.21', 'a restart fetches again instead of reusing a cached value');
+  } finally { await shutdown(); }
+});
+
 test('an upstream timeout is a 504 with a readable message, not a vague 502', async () => {
   const { port } = await boot(['tok-hang'], { requestTimeoutMs: 300 });
   try {
     const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
-    assert.equal(r.status, 504);
+    assert.equal(r.status, 504, r.body);
     assert.match(r.body, /timed out/i);
   } finally { await shutdown(); }
 });
@@ -215,7 +292,7 @@ test('failover serves from the next account and counts the request once', async 
   const { port, hits, dataDir } = await boot(['tok-bad', 'tok-good']);
   try {
     const r = await post(port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 200, r.body);
     assert.equal(JSON.parse(r.body).choices[0].message.content, 'hello');
     assert.ok(Object.keys(hits).length >= 1, 'upstream was reached');
     // usage.json is flushed on a 5s timer, so wait for it instead of assuming

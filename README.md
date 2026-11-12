@@ -12,6 +12,38 @@ Local gateway in front of `api.freepi.ai` that exposes:
 Every upstream request carries the free-pi-cli fingerprint:
 `Authorization: Bearer <jwt>`, `x-session-id`, `x-client-version`.
 
+## Client version (`x-client-version`)
+
+Upstream gates on the fingerprint's version and refuses a stale one before it
+even looks at the request:
+
+```text
+426 {"code":"upgrade_required","message":"your free-pi-cli is below the required minimum (0.6.19); update with: npx free-pi-cli@latest","error":{"type":"free_pi_error"}}
+```
+
+so the gateway does not hard-code it. Every `versionCheckMs` (10 min), and
+always on start — a restart re-reads it instead of trusting a cached value,
+retrying a flaky fetch — it calls the unauthenticated `GET /client-version`
+(the CLI's own update check), which publishes the details:
+
+```json
+{ "min": "0.6.19", "latest": "0.6.19", "min_desktop_version": "0.0.0", "latest_desktop_version": "0.3.4", "models": [ ... ] }
+```
+
+The value sent is `latest` — the release the CLI itself would install. `min` is
+only a floor (used when `latest` is absent), and the locally installed CLI
+(`~/.free-pi/agent/last-seen-version`, then the npx cache) is only a fallback
+for when the fetch fails. It only moves up, so a later refresh never undoes a
+bump. A `426 upgrade_required` on any request is not passed to the client: the
+minimum is read out of the message, adopted, and the request is retried
+immediately (up to twice).
+
+`GET /health` reports the resolved value plus the upstream detail:
+
+```json
+"clientVersion": { "version": "0.6.19", "source": "client-version", "min": "0.6.19", "latest": "0.6.19", "detail": { ... } }
+```
+
 ## Run
 
 ```bash
@@ -92,6 +124,8 @@ prompt in the page). The key is printed at startup and stored in `.admin-key`
 |---|---|---|
 | `port` / `host` | 8787 / 127.0.0.1 | listen address |
 | `base` | https://api.freepi.ai | upstream |
+| `cliVersion` | `auto` | `x-client-version`: `auto` follows `/client-version`; a concrete version pins a floor (upstream can still raise it) |
+| `versionCheckMs` | 600000 (10 min) | how often `/client-version` is re-read |
 | `defaultModel` | deepseek/deepseek-v4-flash | used when the requested model is unknown |
 | `clientKeys` | [] | required API keys for /v1/* (empty = open) |
 | `adminKey` | generated | admin UI key |
@@ -121,7 +155,8 @@ upstream on a scratch `DATA_DIR`, so no network or credentials are needed.
 | `test/lifecycle.test.js` | abort/drain listener hygiene, success-XOR-error terminal state |
 | `test/accounts.test.js` | round-robin cursor purity (`pickOrder` vs `peekOrder`) |
 | `test/session.test.js` | session-id strategies and conversation keying |
-| `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row, distinct session ids under concurrency, 429 `concurrent` rotation, 504 on timeout |
+| `test/version.test.js` | version comparison, 426 minimum parsing, no-downgrade rule |
+| `test/gateway.test.js` | content-length, 400s, stop sequences end-to-end, failover, single usage row, distinct session ids under concurrency, 429 `concurrent` rotation, 426 `upgrade_required` retry, 504 on timeout |
 
 ## Context window and upstream errors
 
@@ -205,6 +240,7 @@ src/usage.js        per-account counters + recent requests, persisted
 src/session.js      upstream session identity (request / conversation / account)
 src/upstream.js     fingerprint client: retry, 401 reload, session rotation/reset
 src/catalog.js      model catalog cache
+src/version.js      x-client-version from GET /client-version (426 upgrade handling)
 src/credentials.js  JWT load/refresh for the cli fallback account
 src/admin.js        admin API + single-page UI
 src/server.js       router, failover, usage recording

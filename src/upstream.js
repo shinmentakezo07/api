@@ -1,8 +1,9 @@
 // upstream.js — HTTP client for api.freepi.ai with the free-pi-cli fingerprint.
 // Per-account headers, retry on 429/5xx, 401 credential refresh,
 // auto /session/reset on concurrent_session.
-import { config, CLIENT_VERSION } from './config.js';
+import { config } from './config.js';
 import { log } from './logger.js';
+import { clientVersion, noteRequiredVersion, requiredVersionFrom, ensureFreshVersion } from './version.js';
 import { sessionIdFor, freshSessionId } from './session.js';
 import { readFileSync } from 'node:fs';
 
@@ -64,7 +65,7 @@ export function fingerprintHeaders(account, extra = {}, path = '', sessionId = a
   const headers = {
     authorization: `Bearer ${account.token}`,
     'x-session-id': sessionId,
-    'x-client-version': CLIENT_VERSION,
+    'x-client-version': clientVersion(),
     'content-type': 'application/json',
     ...extra,
   };
@@ -155,8 +156,12 @@ export async function upstream(path, opts = {}) {
   let adCycles = 0;
   let timeouts = 0;
   let rotates = 0;
+  let upgrades = 0;
   const maxTimeoutRetries = config.retry.timeoutRetries ?? 1;
   const maxRotates = config.concurrentRotateRetries ?? 2;
+  // keep x-client-version current in the background (no-op inside the TTL)
+  ensureFreshVersion().catch(() => {});
+
   // free-pi runs ONE request at a time per x-session-id (429 'concurrent'), so
   // every attempt gets its own id instead of one shared per account.
   let sessionId = opts.sessionId ?? sessionIdFor(account, opts.conversationKey ?? '');
@@ -212,6 +217,19 @@ export async function upstream(path, opts = {}) {
     const concurrentCode = envelope?.code
       ?? (errText.includes('concurrent_session') ? 'concurrent_session'
         : errText.includes('concurrent') ? 'concurrent' : undefined);
+
+    // Upstream gates on x-client-version: a 426 upgrade_required names the
+    // minimum it now demands. Adopt it and retry at once — the client asked
+    // for a completion, not for our version negotiation.
+    if ((res.status === 426 || envelope?.code === 'upgrade_required' || /below the required minimum/i.test(errText)) && upgrades < 2) {
+      const required = requiredVersionFrom(errText);
+      if (required && noteRequiredVersion(required)) {
+        upgrades++;
+        log.warn('retrying with the required client version', { path, account: account.id, required });
+        attempt--;
+        continue;
+      }
+    }
 
     // 429 'concurrent' means THIS session id already has a request in flight
     // ("one request at a time"). Mint a fresh id and retry immediately: no
