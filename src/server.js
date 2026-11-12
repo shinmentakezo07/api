@@ -15,14 +15,44 @@ import { handleAdmin } from './admin.js';
 import { conversationKeyOf } from './session.js';
 import { versionInfo } from './version.js';
 
+// /v1/* is a machine API: any origin may call it (the client key is the gate).
 const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
-  'access-control-allow-headers': 'authorization, content-type, x-api-key, x-admin-key, anthropic-version, anthropic-beta',
+  'access-control-allow-headers': 'authorization, content-type, x-api-key, anthropic-version, anthropic-beta',
 };
 
-function json(res, status, body, extra = {}) {
-  res.writeHead(status, { 'content-type': 'application/json', ...CORS, ...extra });
+// /admin and /admin/api/* are driven by a browser. A wildcard origin there lets
+// any page send the x-admin-key header after a successful preflight, so these
+// routes get same-origin only: no ACAO header unless the request came from the
+// page this server itself serves.
+const ADMIN_CORS = {
+  'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+  'access-control-allow-headers': 'authorization, content-type, x-admin-key',
+};
+
+/** True when the browser said the page lives on this very host:port. */
+function isSameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // non-browser client (curl, SDK): CORS does not apply
+  if (origin === 'null') return false;
+  let host;
+  try { host = new URL(origin).host.toLowerCase(); } catch { return false; }
+  return host === String(req.headers.host ?? '').toLowerCase();
+}
+
+/** Headers for one response: admin routes are same-origin only. */
+function corsFor(req, pathname) {
+  const admin = pathname === '/admin' || pathname.startsWith('/admin/');
+  if (!admin) return CORS;
+  const base = { ...ADMIN_CORS };
+  if (isSameOrigin(req)) base['access-control-allow-origin'] = req.headers.origin ?? 'null';
+  base['vary'] = 'origin';
+  return base;
+}
+
+function json(res, status, body, extra = {}, cors = CORS) {
+  res.writeHead(status, { 'content-type': 'application/json', ...cors, ...extra });
   res.end(JSON.stringify(body));
 }
 
@@ -276,14 +306,17 @@ async function handleChatCompletions(req, res, rid, ctx) {
         recordOutcome(ctx, account.id, '/v1/chat/completions', 502, started, { error: `body copy failed after ${bytes}B: ${err.message}` });
         throw new UpstreamError(502, '', `response body copy failed: ${err.message}`);
       }
-      const m = text.match(/"prompt_tokens":\s*(\d+)/);
-      const m2 = text.match(/"completion_tokens":\s*(\d+)/);
+      // Token counts come from the parsed body, not from a regex over the
+      // serialized text: a model that writes "prompt_tokens" inside its own
+      // content would otherwise overwrite the real counters.
+      let usage = {};
+      try { usage = JSON.parse(text)?.usage ?? {}; } catch { log.warn('unparseable upstream body', { rid, bytes }); }
       // the whole body is known now, so advertise its exact length instead of
       // forcing chunked encoding (lets clients fail fast and detect truncation)
       res.writeHead(up.status, { ...headers, 'content-length': String(Buffer.byteLength(text)), ...CORS });
       res.end(text);
       recordOutcome(ctx, account.id, '/v1/chat/completions', up.status, started, {
-        inputTokens: m ? +m[1] : 0, outputTokens: m2 ? +m2[1] : 0,
+        inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0,
       });
       return;
     }
@@ -291,17 +324,12 @@ async function handleChatCompletions(req, res, rid, ctx) {
     if (!up.ok) throw new UpstreamError(up.status, await up.text().catch(() => ''));
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...CORS });
     let inTok = 0, outTok = 0;
-    let tail = '';
     let lineBuf = '';
     let sawUpstreamError = false;
     const pipe = await pipeBody(up, res, (buf) => {
-      tail = (tail + buf.toString()).slice(-4000);
-      const a = tail.match(/"prompt_tokens":\s*(\d+)/);
-      const b = tail.match(/"completion_tokens":\s*(\d+)/);
-      if (a) inTok = +a[1];
-      if (b) outTok = +b[1];
-      // inspect complete SSE data lines: an upstream error mid-stream keeps a
-      // 200 status — surface it to the client as an OpenAI-style error chunk
+      // inspect complete SSE data lines: usage frames are parsed (not regexed)
+      // and an upstream error mid-stream keeps a 200 status — surface it to the
+      // client as an OpenAI-style error chunk
       lineBuf += buf.toString();
       let nl;
       while ((nl = lineBuf.indexOf('\n')) !== -1) {
@@ -310,16 +338,19 @@ async function handleChatCompletions(req, res, rid, ctx) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]' || !payload.startsWith('{')) continue;
-        try {
-          const obj = JSON.parse(payload);
-          if (obj.error && !obj.choices && !obj.id && !sawUpstreamError) {
-            sawUpstreamError = true;
-            const msgText = obj.error.message ?? 'upstream stream error';
-            if (ctx) ctx.streamError = msgText;
-            log.error('upstream error inside SSE stream', { rid, error: msgText });
-            res.write(`data: ${JSON.stringify({ error: { message: msgText, type: 'upstream_error', code: obj.error.code ?? obj.error.type ?? null } })}\n\n`);
-          }
-        } catch {}
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        if (obj.usage) {
+          if (Number.isFinite(obj.usage.prompt_tokens)) inTok = obj.usage.prompt_tokens;
+          if (Number.isFinite(obj.usage.completion_tokens)) outTok = obj.usage.completion_tokens;
+        }
+        if (obj.error && !obj.choices && !obj.id && !sawUpstreamError) {
+          sawUpstreamError = true;
+          const msgText = obj.error.message ?? 'upstream stream error';
+          if (ctx) ctx.streamError = msgText;
+          log.error('upstream error inside SSE stream', { rid, error: msgText });
+          res.write(`data: ${JSON.stringify({ error: { message: msgText, type: 'upstream_error', code: obj.error.code ?? obj.error.type ?? null } })}\n\n`);
+        }
       }
     });
     if (!pipe.ok) {
@@ -383,6 +414,10 @@ async function handleMessages(req, res, rid, ctx) {
   }, { path: '/v1/messages', rid, ctx });
 }
 
+// CJK and other wide scripts are roughly one token per character, latin text
+// roughly four characters per token.
+const WIDE_CHAR = /[\u1100-\u11ff\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
+
 async function handleCountTokens(req, res) {
   let body;
   try { body = JSON.parse((await readBody(req)).toString() || '{}'); }
@@ -391,10 +426,69 @@ async function handleCountTokens(req, res) {
   // 4 chars/token is optimistic for code-heavy prompts; the divisor is
   // configurable and defaults to a conservative 3.5.
   const perToken = Number(config.countTokensCharsPerToken) > 0 ? Number(config.countTokensCharsPerToken) : 4;
-  const chars = JSON.stringify(body.messages ?? []).length
-    + JSON.stringify(body.system ?? '').length
-    + (body.tools ? JSON.stringify(body.tools).length : 0);
-  return json(res, 200, { input_tokens: Math.ceil(chars / perToken) });
+
+  // Walk the text the request actually forwards instead of stringifying the
+  // whole body: JSON punctuation, quotes and escapes are not tokens, and image
+  // base64 is not text. Stringifying over-counted a tools-heavy request badly.
+  let chars = 0;
+  let wide = 0;
+  const addText = (v) => {
+    if (typeof v !== 'string' || !v) return;
+    const hits = v.match(WIDE_CHAR);
+    if (hits) wide += hits.length;
+    chars += v.length;
+  };
+  const walk = (content) => {
+    if (typeof content === 'string') return addText(content);
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      switch (block.type) {
+        case 'text': addText(block.text); break;
+        case 'thinking': addText(block.thinking); break;
+        case 'image': chars += 1600; break;             // fixed cost, not base64
+        case 'document': chars += 800; break;
+        case 'tool_use':
+        case 'tool_call':
+          addText(block.name ?? block.function?.name);
+          if (block.input !== undefined) addText(JSON.stringify(block.input));
+          else if (block.function?.arguments) addText(block.function.arguments);
+          break;
+        case 'tool_result':
+          walk(block.content);
+          break;
+        default: addText(block.text);
+      }
+    }
+  };
+
+  walk(body.system);
+  let messages = 0;
+  for (const m of Array.isArray(body.messages) ? body.messages : []) {
+    messages += 1;
+    walk(m?.content);
+    if (typeof m?.role === 'string') addText(m.role);
+    // an OpenAI-style tool call is {id,type,function:{name,arguments}}
+    if (Array.isArray(m?.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        addText(tc?.function?.name);
+        addText(tc?.function?.arguments);
+      }
+    }
+  }
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      addText(tool?.name ?? tool?.function?.name);
+      addText(tool?.description ?? tool?.function?.description);
+      const schema = tool?.input_schema ?? tool?.function?.parameters;
+      if (schema) addText(JSON.stringify(schema));
+    }
+  }
+  if (body.tool_choice) addText(JSON.stringify(body.tool_choice));
+
+  const narrow = Math.max(0, chars - wide);
+  // per-message framing plus the request's own priming tokens
+  return json(res, 200, { input_tokens: Math.ceil(narrow / perToken) + wide + messages * 4 + 3 });
 }
 
 async function handleModels(req, res) {
@@ -454,17 +548,18 @@ export function createServer() {
     const rid = randomUUID().slice(0, 8);
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
     const route = matchRoute(req.method, url.pathname);
+    const cors = corsFor(req, url.pathname);
     const ctx = { attempts: 0, failovers: 0, account: null, tried: [], streamError: null, recorded: false };
 
-    if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
+    if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
 
     log.info('request', { rid, method: req.method, path: url.pathname, ua: req.headers['user-agent'] });
 
     if (!clientAuthorized(req)) {
-      res.writeHead(401, { 'content-type': 'application/json', ...CORS });
+      res.writeHead(401, { 'content-type': 'application/json', ...cors });
       return res.end(JSON.stringify(errorBody(route?.anthropic ?? false, 401, 'invalid client api key')));
     }
-    if (!route) return json(res, 404, errorBody(false, 404, `no route ${req.method} ${url.pathname}`));
+    if (!route) return json(res, 404, errorBody(false, 404, `no route ${req.method} ${url.pathname}`), {}, cors);
 
     res.on('finish', () => log.info('response', {
       rid, path: url.pathname, status: res.statusCode, ms: Date.now() - started,
@@ -485,7 +580,7 @@ export function createServer() {
       // then rethrow) must not be counted twice
       if (!ctx.recorded) record(ctx.account ?? 'gateway', { path: url.pathname, status, ms: Date.now() - started, error: detail });
       log.error('route failed', { rid, path: url.pathname, status, error: err.message, account: ctx.account, attempts: ctx.attempts, upstreamBody: String(detail).slice(0, 800) });
-      if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json', ...CORS });
+      if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json', ...cors });
       if (!res.writableEnded) res.end(JSON.stringify(errorBody(route.anthropic, status, detail)));
     }
   });
